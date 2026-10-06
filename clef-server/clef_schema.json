@@ -1,0 +1,17 @@
+{
+  "question_id": "food",
+  "type": "choice",
+  "instructions": "Look at the image and decide whether the main food item shown is a hot dog. Answer hotdog only if a hot dog (sausage in a bun) is clearly the subject; anything else, including other sausages without a bun, sandwiches, burgers, or non-food images, is not_hotdog.",
+  "criteria": {
+    "hotdog": "A hot dog: a grilled or steamed sausage (frankfurter, wiener, bratwurst) served in a sliced bun, possibly with toppings such as mustard, ketchup, onions, relish, or sauerkraut. Several hot dogs on one plate also count.",
+    "not_hotdog": "Anything that is not a hot dog: other foods (burgers, sandwiches, pizza, sausages without a bun, corn dogs, tacos, etc.), drinks, people, animals, objects, scenes, or images where no hot dog is visible."
+  },
+  "state": {
+    "task": "Classify the food shown in the image",
+    "source": "user upload"
+  },
+  "label_map": {
+    "hotdog": "hotdog",
+    "not_hotdog": "not_hotdog"
+  }
+}

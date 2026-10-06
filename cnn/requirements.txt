@@ -1,0 +1,25 @@
+# CNN: training notebook + inference server + tests (Python >= 3.11). Installed by ./run.sh.
+# model + data
+torch>=2.3
+torchvision>=0.18
+pillow>=10.0
+numpy>=1.26
+scikit-learn>=1.4
+matplotlib>=3.8
+tqdm>=4.66
+kagglehub>=0.2.5
+datasets>=2.19          # only for DATA_SOURCE=hf
+# notebook (interactive in Jupyter, or headless via ./run.sh train)
+jupyter
+ipykernel>=6.29
+ipywidgets>=8.1         # tqdm progress bars in Jupyter
+nbformat>=5.9
+nbclient>=0.10
+nbconvert>=7.16
+# inference server
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+# tests
+pytest>=8.0
+httpx>=0.27

@@ -1,0 +1,2 @@
+# The UI is static HTML/CSS/JS served by Python's stdlib http.server.
+# mock-server.py is stdlib-only as well. Nothing to install.

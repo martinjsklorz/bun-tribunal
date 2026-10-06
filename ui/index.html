@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bun Tribunal</title>
+  <meta name="description" content="Three models enter. One sausage leaves. A general-purpose vision LLM vs CLEF-Flash vs a ConvNeXt fine-tuned on a laptop, on the only question that matters.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%23ffcc29'/%3E%3Crect x='8' y='24' width='48' height='18' rx='9' fill='%23e8a95b'/%3E%3Crect x='6' y='27' width='52' height='11' rx='5.5' fill='%23c8442f'/%3E%3Cpath d='M12 32q4-4 8 0t8 0 8 0 8 0 8 0' stroke='%23ffd400' stroke-width='3' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;700;900&family=Archivo+Black&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#arena">Skip to the arena</a>
+
+  <!-- Pitch deck mode: fake conference stage header -->
+  <div class="stage" id="stage" aria-hidden="true">
+    <div class="stage__inner">
+      <span class="stage__live"><span class="stage__live-dot"></span>LIVE</span>
+      <span class="stage__name">StartupBattlefield<span class="stage__year">’26</span></span>
+      <span class="stage__sub">Demo Day · Stage B · Track: Deep Sausage</span>
+      <div class="stage__ticker" role="presentation">
+        <div class="stage__ticker-track">
+          <span>TAM: all food</span><span>SAM: hotdogs</span><span>SOM: this hotdog</span>
+          <span>Disrupting the $0B hotdog-verification market</span><span>Burn rate: mostly mustard</span>
+          <span>Pre-revenue, post-lunch</span><span>Judges are taking notes</span><span>Now with 50% more models</span>
+          <span>TAM: all food</span><span>SAM: hotdogs</span><span>SOM: this hotdog</span>
+          <span>Disrupting the $0B hotdog-verification market</span><span>Burn rate: mostly mustard</span>
+          <span>Pre-revenue, post-lunch</span><span>Judges are taking notes</span><span>Now with 50% more models</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand__logo" viewBox="0 0 64 64" aria-hidden="true">
+        <circle cx="32" cy="32" r="30" fill="var(--mustard)"/>
+        <rect x="8" y="24" width="48" height="18" rx="9" fill="#e8a95b"/>
+        <rect x="6" y="27" width="52" height="11" rx="5.5" fill="#c8442f"/>
+        <path d="M12 32q4-4 8 0t8 0 8 0 8 0 8 0" stroke="#ffd400" stroke-width="3" fill="none" stroke-linecap="round"/>
+      </svg>
+      <div>
+        <h1 class="brand__name">Bun Tribunal</h1>
+        <p class="brand__tagline" id="tagline">Three models enter. One sausage leaves.</p>
+      </div>
+      <span class="badge-series" title="Term sheet is in the mail. Probably.">Series A pending</span>
+    </div>
+    <div class="topbar__right">
+      <ul class="health" aria-label="Backend status">
+        <li class="health__item" id="health-llm" data-status="loading"><span class="dot" aria-hidden="true"></span><span class="health__text">LLM · checking…</span></li>
+        <li class="health__item" id="health-clef" data-status="loading"><span class="dot" aria-hidden="true"></span><span class="health__text">CLEF-Flash · checking…</span></li>
+        <li class="health__item" id="health-cnn" data-status="loading"><span class="dot" aria-hidden="true"></span><span class="health__text">CNN · checking…</span></li>
+      </ul>
+      <button class="pitch-toggle" id="pitch-toggle" type="button" aria-pressed="false">
+        <span class="pitch-toggle__track" aria-hidden="true"><span class="pitch-toggle__thumb"></span></span>
+        Pitch deck mode
+      </button>
+    </div>
+  </header>
+
+  <div class="offline-help" id="offline-help" hidden>
+    <strong>Can’t reach <span id="offline-names">a backend</span>.</strong>
+    Start everything with <code>./run.sh</code>.
+    Already running? Check that CORS allows this origin (<span id="origin"></span>) and the URLs
+    (<code>?llm=…&amp;clef=…&amp;cnn=…</code>).
+  </div>
+
+  <main class="arena" id="arena">
+    <!-- Left: the phone -->
+    <section class="left" aria-label="Snap or upload a photo">
+      <div class="phone" id="phone">
+        <div class="phone__notch" aria-hidden="true"></div>
+        <div class="phone__screen">
+          <div class="phone__statusbar" aria-hidden="true"><span id="phone-clock">9:41</span><span class="phone__bars"><i></i><i></i><i></i><i></i></span></div>
+          <div class="phone__appbar">
+            <span class="phone__appname">Bun Tribunal</span>
+            <span class="phone__appsub">beta · do not eat the phone</span>
+          </div>
+          <div class="viewfinder" id="viewfinder">
+            <button class="viewfinder__empty" id="empty-state" type="button">
+              <svg viewBox="0 0 48 48" aria-hidden="true"><path d="M6 16a4 4 0 0 1 4-4h6l3-4h10l3 4h6a4 4 0 0 1 4 4v20a4 4 0 0 1-4 4H10a4 4 0 0 1-4-4z" fill="none" stroke="currentColor" stroke-width="3" stroke-linejoin="round"/><circle cx="24" cy="25" r="8" fill="none" stroke="currentColor" stroke-width="3"/></svg>
+              <span class="viewfinder__title">Point at food. Or not-food.</span>
+              <span class="viewfinder__hint">Tap to choose · drop · or paste an image</span>
+            </button>
+            <img class="viewfinder__img" id="preview" alt="" hidden>
+            <div class="scanline" id="scanline" hidden aria-hidden="true"></div>
+            <div class="phone-banner" id="phone-banner" hidden></div>
+          </div>
+          <div class="phone__controls">
+            <button class="ctrl" id="btn-upload" type="button" aria-label="Choose an image file">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="9" cy="10" r="2" fill="currentColor"/><path d="m4 18 5-5 4 4 3-3 4 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+            </button>
+            <button class="shutter" id="btn-shutter" type="button" aria-label="Take a photo (or choose one)">
+              <span class="shutter__inner"></span>
+            </button>
+            <button class="ctrl" id="btn-rerun" type="button" aria-label="Run all three models again on this image" disabled>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.3-5.6M20 4v5h-5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+          </div>
+          <div class="phone__homebar" aria-hidden="true"></div>
+        </div>
+      </div>
+      <input type="file" id="file-input" accept="image/jpeg,image/png,image/webp,image/*" hidden>
+      <input type="file" id="camera-input" accept="image/*" capture="environment" hidden>
+
+      <div class="samples">
+        <h2 class="samples__title">No snack handy? Try a sample</h2>
+        <ul class="samples__list" id="samples"></ul>
+      </div>
+    </section>
+
+    <!-- Right: results -->
+    <section class="right" aria-label="Results">
+      <div class="summary" id="summary" aria-live="polite">
+        <div class="summary__verdict" id="summary-verdict">
+          <span class="summary__kicker">Head to head</span>
+          <span class="summary__headline" id="summary-headline">Waiting for a contestant</span>
+          <span class="summary__detail" id="summary-detail">Upload, drop, paste or snap a photo. All three models judge it in parallel.</span>
+          <ul class="votes" id="votes" aria-label="Votes" hidden></ul>
+          <button type="button" class="retry-btn retry-btn--summary" id="retry-failed" hidden><span class="retry-btn__icon" aria-hidden="true">↻</span><span id="retry-failed-text">Retry failed</span></button>
+        </div>
+        <div class="summary__speed" id="summary-speed" hidden>
+          <span class="summary__kicker">Speed</span>
+          <span class="summary__headline summary__headline--sm" id="speed-headline"></span>
+          <span class="summary__detail" id="speed-detail"></span>
+        </div>
+        <div class="summary__truth" id="summary-truth" hidden>
+          <span class="summary__kicker">Ground truth</span>
+          <div class="truth-buttons" role="group" aria-label="What was it really?">
+            <button type="button" class="truth-btn truth-btn--hot" data-truth="hotdog" aria-pressed="false">Actually it WAS a hotdog</button>
+            <button type="button" class="truth-btn truth-btn--not" data-truth="not_hotdog" aria-pressed="false">It was NOT</button>
+          </div>
+          <span class="summary__detail" id="truth-detail"></span>
+        </div>
+      </div>
+
+      <div class="cards">
+        <article class="card" id="card-llm" data-model="llm" aria-labelledby="card-llm-title"></article>
+        <article class="card" id="card-clef" data-model="clef" aria-labelledby="card-clef-title"></article>
+        <article class="card" id="card-cnn" data-model="cnn" aria-labelledby="card-cnn-title"></article>
+      </div>
+
+      <section class="scoreboard" aria-labelledby="score-title">
+        <div class="scoreboard__head">
+          <h2 id="score-title">Session scoreboard</h2>
+          <button type="button" class="link-btn" id="score-reset">Reset</button>
+        </div>
+        <div class="table-wrap">
+          <table class="score-table">
+            <thead>
+              <tr><th scope="col">Model</th><th scope="col">Accuracy</th><th scope="col">Graded</th><th scope="col">Avg total</th><th scope="col">Speed wins</th></tr>
+            </thead>
+            <tbody id="score-body"></tbody>
+          </table>
+        </div>
+        <p class="scoreboard__foot" id="score-foot"></p>
+      </section>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <p>Unofficial parody demo. All artwork original. No sausages were harmed in the training of these models.</p>
+    <p class="footer__urls" id="footer-urls"></p>
+  </footer>
+
+  <div class="drop-overlay" id="drop-overlay" aria-hidden="true">
+    <div class="drop-overlay__box">Drop it like it’s hot(dog)</div>
+  </div>
+  <canvas class="confetti" id="confetti" aria-hidden="true"></canvas>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

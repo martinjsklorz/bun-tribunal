@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+cnn/artifacts/*
+!cnn/artifacts/.gitkeep
+cnn/data/
+logs/
+.run-prefs
+llm-server/.env
+llm-server/.env.bak
+.DS_Store
+.ipynb_checkpoints/

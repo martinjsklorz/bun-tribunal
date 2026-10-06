@@ -1,0 +1,5 @@
+# Everything run.sh installs, if you prefer to manage your own environment:
+#   pip install -r requirements.txt
+-r clef-server/requirements.txt
+-r cnn/requirements.txt
+-r llm-server/requirements.txt
