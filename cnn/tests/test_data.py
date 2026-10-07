@@ -61,3 +61,27 @@ def test_unknown_arch_rejected():
 
     with pytest.raises(ValueError):
         build_model("scratch")
+
+
+def test_food101_splits_are_disjoint_and_balanced(tmp_path):
+    """Default data source: no account, official non-overlapping splits, 250 + 250 test images."""
+    import json
+    from hotdog_data import FOOD101_HARD_NEGATIVES, load_food101_splits
+
+    others = [f"other_{i}" for i in range(10)]
+    classes = ["hot_dog", *FOOD101_HARD_NEGATIVES, *others]
+    meta = tmp_path / "food-101" / "meta"
+    meta.mkdir(parents=True)
+    for split, n, n_hot in (("train", 40, 750), ("test", 20, 300)):
+        idx = {c: [f"{c}/{split}{i}" for i in range(n_hot if c == "hot_dog" else n)] for c in classes}
+        (meta / f"{split}.json").write_text(json.dumps(idx))
+
+    (tr_x, tr_y, tr_cls), (te_x, te_y) = load_food101_splits(tmp_path, hard_per_class=30, other_per_class=5, seed=1)
+    assert set(tr_x).isdisjoint(te_x)
+    assert tr_y.count(0) == 750 and tr_cls.count("hot_dog") == 750                     # every training hot dog
+    assert tr_cls.count("french_fries") == 30 and tr_cls.count("other_0") == 5         # look-alikes oversampled
+    assert te_y.count(0) == 250 and te_y.count(1) == 250                               # SeeFood-sized test set
+    hard_in_test = sum(1 for p in te_x if p.split("/")[-2] in FOOD101_HARD_NEGATIVES)
+    assert hard_in_test == 125                                                         # half of the negatives
+    again = load_food101_splits(tmp_path, hard_per_class=30, other_per_class=5, seed=1)
+    assert again[1][0] == te_x                                                         # deterministic

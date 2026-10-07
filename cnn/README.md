@@ -1,7 +1,7 @@
 # Bun Tribunal: CNN contender
 
-A convolutional network for **hotdog / not hotdog**: an ImageNet-pretrained ConvNeXt-Tiny, fine-tuned on the Kaggle
-SeeFood set plus Food-101 hard negatives, calibrated, and served with the same API as the 9B CLEF-Flash VLM
+A convolutional network for **hotdog / not hotdog**: an ImageNet-pretrained ConvNeXt-Tiny, fine-tuned on
+Food-101 (hot dogs plus look-alike dishes as hard negatives), calibrated, and served with the same API as the 9B CLEF-Flash VLM
 (see `../CONTRACT.md`). Port **8002**, model name **`cnn`**.
 
 ```
@@ -39,18 +39,21 @@ Set these as environment variables (e.g. `ARCH=efficientnet_b0 ./run.sh train`) 
 
 | Setting | Default | Options |
 |---|---|---|
-| `DATA_SOURCE` | `kaggle`: [`dansbecker/hot-dog-not-hot-dog`](https://www.kaggle.com/datasets/dansbecker/hot-dog-not-hot-dog) | `hf`: a Hugging Face dataset (check the id and columns in the notebook) · `folder`: `cnn/data/{train,test}/{hot_dog,not_hot_dog}/` |
-| `ADD_FOOD101` | `1`: adds ~1 000 Food-101 hotdogs + ~2 200 negatives (look-alikes such as fries, prime rib and tacos oversampled) to **training only** | `0`: source data only |
+| `DATA_SOURCE` | `food101`: [Food-101](https://data.vision.ee.ethz.ch/cvl/datasets_extra/food-101/), free, no account | `kaggle`: the [SeeFood set](https://www.kaggle.com/datasets/dansbecker/hot-dog-not-hot-dog) (needs a Kaggle account) · `hf`: a Hugging Face dataset (check the id and columns in the notebook) · `folder`: `cnn/data/{train,test}/{hot_dog,not_hot_dog}/` |
+| `ADD_FOOD101` | `1` (only for `kaggle` / `hf` / `folder`): adds ~1 000 Food-101 hot dogs + ~2 200 negatives to **training only** | `0`: source data only |
 | `ARCH` | `convnext_tiny` (27.8M params, most accurate) | `efficientnet_b0` (4.0M, about 2× faster) · `mobilenet_v3_large` (4.2M, fastest) |
 | `DEVICE` | auto: CUDA, then Apple MPS, then CPU | force one, e.g. `cpu` |
 
-**Kaggle credentials** are required for the default source: `~/.kaggle/kaggle.json`, or `KAGGLE_USERNAME` and
-`KAGGLE_KEY` in the environment. **Food-101** is a one-time ~5 GB download into `cnn/data/`. Food-101 images that
-duplicate any Kaggle image are removed before training, so the test set stays unseen.
+**No account needed** with the default source. Food-101 is a one-time ~5 GB download into `cnn/data/`. Training uses
+its train split: all 750 hot dogs plus ~2 200 other dishes, two thirds of them look-alikes (fries, prime rib, tacos …).
+The test set is 250 hot dogs + 250 other dishes from its separate test split, the same size and mix as Kaggle's SeeFood
+test set (which was cut from Food-101). With `DATA_SOURCE=kaggle`, Kaggle credentials are needed
+(`~/.kaggle/access_token` or `~/.kaggle/kaggle.json`), and Food-101 images that duplicate any Kaggle image are removed
+before training.
 
 ### Expected result
 
-On an Apple Silicon Mac with the defaults, training takes roughly 15–25 min. On the 500 Kaggle test images:
+On an Apple Silicon Mac, training takes roughly 15–25 min. A run on the Kaggle SeeFood set (500 test images) scored:
 
 | Accuracy | Precision | Recall | ROC-AUC | ECE |
 |---|---|---|---|---|

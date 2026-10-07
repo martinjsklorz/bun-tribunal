@@ -2,7 +2,10 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 python-multipart>=0.0.9
 pillow>=10.0
+huggingface_hub>=0.30
+# Apple Silicon: the 4-bit MLX quantization (mlx-community/clef-flash-4bit)
+mlx-vlm>=0.7.4,<0.8; sys_platform == "darwin" and platform_machine == "arm64"
+# Everywhere else (NVIDIA GPU / CPU): the full BF16 release (Cloudflare/clef-flash)
 torch>=2.11
 transformers>=5.10.2
-huggingface_hub>=0.30
 accelerate>=1.0

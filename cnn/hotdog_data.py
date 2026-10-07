@@ -108,42 +108,77 @@ def load_hf(dataset_id: str, image_col: str, label_col: str, test_split: str):
     return convert(ds["train"]), (convert(ds[test_split]) if test_split in ds else ([], []))
 
 
-def load_food101(root: Path, n_hotdog: int, hard_per_class: int, other_per_class: int, seed: int = 0):
-    """Sample a hotdog/not-hotdog set from Food-101 (101 classes x 1000 images, ~5 GB download).
-
-    Uses both of Food-101's own splits as a *training pool*; our test set stays the Kaggle one.
-    Returns (paths, labels, food_class_per_image).
-    """
-    from torchvision.datasets import Food101
-
-    Food101(str(root), split="train", download=True)  # downloads + extracts once
+def _food101_index(root: Path):
+    """Download Food-101 once (~5 GB, free, no account) and return (base_dir, {split: {class: [ids]}})."""
     base = Path(root) / "food-101"
-    pool: dict[str, list[str]] = {}
-    for split in ("train", "test"):
-        for cls, ids in json.loads((base / "meta" / f"{split}.json").read_text()).items():
-            pool.setdefault(cls, []).extend(ids)
+    if not (base / "meta" / "train.json").exists():
+        from torchvision.datasets import Food101
 
-    missing = [c for c in FOOD101_HARD_NEGATIVES if c not in pool]
+        Food101(str(root), split="train", download=True)  # downloads + extracts from ETH Zürich
+    index = {split: json.loads((base / "meta" / f"{split}.json").read_text()) for split in ("train", "test")}
+    missing = [c for c in FOOD101_HARD_NEGATIVES if c not in index["train"]]
     if missing:
         print("note: hard-negative classes not in Food-101:", missing)
-    hard = [c for c in FOOD101_HARD_NEGATIVES if c in pool]
+    return base, index
 
-    rng = random.Random(seed)
+
+def _sample(base: Path, ids_by_class: dict, plan: dict, rng: random.Random):
+    """plan = {class: k}. Returns (paths, labels, classes); label 0 = hot_dog."""
     paths, labels, classes = [], [], []
-
-    def take(cls, k, y):
-        ids = sorted(pool[cls])
-        for i in rng.sample(ids, k=min(k, len(ids))):
+    for cls in sorted(plan):
+        ids = sorted(ids_by_class[cls])
+        for i in rng.sample(ids, k=min(plan[cls], len(ids))):
             paths.append(str(base / "images" / f"{i}.jpg"))
-            labels.append(y)
+            labels.append(0 if cls == "hot_dog" else 1)
             classes.append(cls)
-
-    take("hot_dog", n_hotdog, 0)
-    for cls in sorted(pool):
-        if cls == "hot_dog":
-            continue
-        take(cls, hard_per_class if cls in hard else other_per_class, 1)
     return paths, labels, classes
+
+
+def _negative_plan(classes, hard: set, n_hard_per_class: int, n_other_per_class: int) -> dict:
+    return {c: (n_hard_per_class if c in hard else n_other_per_class) for c in classes if c != "hot_dog"}
+
+
+def load_food101_splits(root: Path, hard_per_class: int, other_per_class: int,
+                        test_hotdogs: int = 250, test_negatives: int = 250, seed: int = 0):
+    """Hotdog / not-hotdog train AND test sets from Food-101's official, non-overlapping splits.
+
+    Train: every training hot dog (750) plus negatives, with look-alike dishes oversampled.
+    Test:  `test_hotdogs` hot dogs + `test_negatives` other dishes from the test split, half of them
+           look-alikes: the same size and mix as the Kaggle SeeFood test set (which was cut from Food-101).
+    Returns ((train_paths, train_labels, train_classes), (test_paths, test_labels)).
+    """
+    base, index = _food101_index(root)
+    rng = random.Random(seed)
+    hard = {c for c in FOOD101_HARD_NEGATIVES if c in index["train"]}
+
+    train_plan = {"hot_dog": 10**9, **_negative_plan(index["train"], hard, hard_per_class, other_per_class)}
+    train = _sample(base, index["train"], train_plan, rng)
+
+    others = sorted(c for c in index["test"] if c != "hot_dog" and c not in hard)
+    n_hard = test_negatives // 2
+    test_plan = {"hot_dog": test_hotdogs}
+    for i, c in enumerate(sorted(hard)):          # spread the look-alike half evenly over the hard classes
+        test_plan[c] = n_hard // len(hard) + (1 if i < n_hard % len(hard) else 0)
+    n_other = test_negatives - n_hard
+    for i, c in enumerate(others):                # and the rest over all other classes
+        k = n_other // len(others) + (1 if i < n_other % len(others) else 0)
+        if k:
+            test_plan[c] = k
+    test_x, test_y, _ = _sample(base, index["test"], test_plan, rng)
+    return train, (test_x, test_y)
+
+
+def load_food101(root: Path, n_hotdog: int, hard_per_class: int, other_per_class: int, seed: int = 0):
+    """Extra *training* images from Food-101 (both splits) for the other data sources.
+    Returns (paths, labels, food_class_per_image)."""
+    base, index = _food101_index(root)
+    pool: dict[str, list[str]] = {}
+    for split in ("train", "test"):
+        for cls, ids in index[split].items():
+            pool.setdefault(cls, []).extend(ids)
+    hard = {c for c in FOOD101_HARD_NEGATIVES if c in pool}
+    plan = {"hot_dog": n_hotdog, **_negative_plan(pool, hard, hard_per_class, other_per_class)}
+    return _sample(base, pool, plan, random.Random(seed))
 
 
 # ---------------------------------------------------------------- de-duplication

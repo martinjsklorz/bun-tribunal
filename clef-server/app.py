@@ -1,7 +1,8 @@
 """CLEF-Flash hotdog classifier — implements bun-tribunal CONTRACT.md (port 8001).
 
 Started by ./run.sh (port 8001); weights come from ./run.sh download.
-Env:  CLEF_MODEL (default Cloudflare/clef-flash, or local path), DEVICE, DTYPE (bf16|fp16|fp32),
+Env:  CLEF_BACKEND (auto|mlx|torch; auto = 4-bit MLX on Apple Silicon, full BF16 PyTorch elsewhere),
+      CLEF_MODEL (Hub repo id or local dir; default depends on the backend), DEVICE, DTYPE (torch only),
       CLEF_SCHEMA, MAX_IMAGE_SIDE (1024), MAX_UPLOAD_MB (25), HF_HOME.
 """
 from __future__ import annotations
@@ -26,8 +27,8 @@ logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 
 
 def make_backend():
-    from clef_backend import ClefBackend  # torch imported lazily inside loader thread
-    return ClefBackend(os.environ.get("CLEF_MODEL", "Cloudflare/clef-flash"), load_prompt())
+    import clef_backend  # torch / mlx are imported lazily inside the loader thread
+    return clef_backend.make_backend(load_prompt())
 
 
 def create_app() -> FastAPI:
@@ -50,6 +51,9 @@ def create_app() -> FastAPI:
             "model": MODEL_NAME,
             "device": backend.device,
             "ready": bool(backend.ready),
+            "backend": backend.kind,          # "mlx" | "torch"
+            "weights": backend.weights,       # e.g. "4-bit MLX quantization"
+            "model_id": backend.model_id,
         }
         if backend.error:
             body["error"] = backend.error
