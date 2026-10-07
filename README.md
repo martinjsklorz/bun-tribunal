@@ -7,7 +7,7 @@
 | | Contender | What it is | Runs |
 |---|---|---|---|
 | 🟣 | **LLM** | A general-purpose vision chatbot asked for a verdict, a confidence and a one-line reason | via any OpenAI-compatible API: OpenAI, OpenRouter, or locally with Ollama / LM Studio |
-| 🟠 | **CLEF-Flash** | Cloudflare's 9.4B decision model. It doesn't write text; it returns a probability per allowed answer | locally (~19 GB of weights) |
+| 🟠 | **CLEF-Flash** | Cloudflare's 9.4B decision model. It doesn't write text; it returns a probability per allowed answer | locally, as a **4-bit MLX quantization** on Apple Silicon (~6 GB); full BF16 weights elsewhere (~19 GB) |
 | 🔵 | **CNN** | ConvNeXt-Tiny (28M params), fine-tuned on your laptop in ~20 min | locally |
 
 Upload, drop, paste or snap a photo. All three judge it in parallel, and you get their verdicts, confidences and
@@ -22,8 +22,9 @@ speeds side by side, plus a session scoreboard once you tell it the truth.
 That's it. The first run creates a Python environment, installs everything and walks you through setting up each
 model (you can skip any of them), then starts the app and opens **http://localhost:8080**. Ctrl+C stops everything.
 
-**Needs:** macOS or Linux, Python 3.11+ (`brew install python@3.12`), and for the real models an Apple Silicon Mac
-with 32 GB+ memory (CLEF-Flash) or an NVIDIA GPU. The LLM and the CNN also run fine on smaller machines.
+**Needs:** macOS or Linux and Python 3.11+ (`brew install python@3.12`). For CLEF-Flash: an Apple Silicon Mac with
+16 GB+ memory (it runs the 4-bit MLX version) or an NVIDIA GPU with 24 GB+ (full model). The LLM and the CNN run fine
+on smaller machines.
 
 ## Everything `run.sh` does
 
@@ -32,7 +33,7 @@ with 32 GB+ memory (CLEF-Flash) or an NVIDIA GPU. The LLM and the CNN also run f
 | `./run.sh` | Set up what's missing (it asks first), start everything, open the browser |
 | `./run.sh llm` | Pick the LLM provider (OpenAI, OpenRouter, Ollama, LM Studio, other), enter a key, test it with one picture |
 | `./run.sh train` | Train the CNN: downloads the data, fine-tunes, evaluates, exports. Shows live progress and writes an HTML report |
-| `./run.sh download` | Download the CLEF-Flash weights (~19 GB, resumable) |
+| `./run.sh download` | Download the CLEF-Flash weights: 4-bit MLX on Apple Silicon (~6 GB), full model elsewhere (~19 GB). Resumable |
 | `./run.sh status` | What's set up, what's running |
 | `./run.sh test` | All test suites (no keys or downloads needed) |
 | `LAN=1 ./run.sh` | Also serve your Wi-Fi, to try it on your phone (the address is printed). Anyone on that Wi-Fi can then use your LLM key, so use it on networks you trust |
@@ -48,14 +49,18 @@ distribution; otherwise it's the number the model states itself, and the card ma
 Rate limits and overloaded providers are retried automatically. Reasoning models get extra room to think.
 → [llm-server/README.md](llm-server/README.md)
 
-**CLEF-Flash** (`clef-server/`). This is [Cloudflare/clef-flash](https://huggingface.co/Cloudflare/clef-flash),
-asked one typed question with the options `hotdog` / `not_hotdog`, each with a short description. Edit
+**CLEF-Flash** (`clef-server/`). Cloudflare's [CLEF-Flash](https://huggingface.co/Cloudflare/clef-flash), asked one
+typed question with the options `hotdog` / `not_hotdog`, each with a short description. On a Mac it runs
+[`mlx-community/clef-flash-4bit`](https://huggingface.co/mlx-community/clef-flash-4bit), a **4-bit quantized MLX
+version** of the model: a third of the size of the full BF16 weights, fast on the Apple GPU, with slightly less precise
+probabilities. Elsewhere it runs the full model with PyTorch (`CLEF_BACKEND=torch` forces that on a Mac too). Edit
 `clef-server/clef_schema.json` to change the question. → [clef-server/README.md](clef-server/README.md)
 
-**CNN** (`cnn/`). An ImageNet-pretrained ConvNeXt-Tiny, fine-tuned on Kaggle's SeeFood hot dog set plus extra hot
-dogs and look-alike dishes (fries, tacos, prime rib …) from Food-101. Food-101 images that duplicate any Kaggle image are
-removed first, so the test score isn't inflated by leaked test images. A typical run scores **94 % accuracy on the 500 held-out test images** (precision
-0.99, recall 0.89, ROC-AUC 0.99), with calibrated confidences, in about 20 minutes on an Apple Silicon Mac.
+**CNN** (`cnn/`). An ImageNet-pretrained ConvNeXt-Tiny, fine-tuned on hot dogs and look-alike dishes (fries, tacos,
+prime rib …) from [Food-101](https://data.vision.ee.ethz.ch/cvl/datasets_extra/food-101/), a free download that needs no
+account. It is tested on 500 images from Food-101's separate test split. A run on Kaggle's SeeFood set, which is cut from
+Food-101 the same way, scored **94 % accuracy on 500 held-out test images** (precision 0.99, recall 0.89, ROC-AUC 0.99),
+with calibrated confidences, in about 20 minutes on an Apple Silicon Mac.
 The notebook `cnn/train_hotdog_cnn.ipynb` explains every step and shows Grad-CAM heatmaps of what the model looks
 at. → [cnn/README.md](cnn/README.md)
 
@@ -90,7 +95,8 @@ Local state that is never committed: `.venv/` (Python packages), `llm-server/.en
 The code in this repository is released under the [MIT License](LICENSE).
 
 It does not cover the models and data the project downloads, which keep their own terms:
-[CLEF-Flash](https://huggingface.co/Cloudflare/clef-flash) (Apache-2.0), the ImageNet-pretrained torchvision weights,
-the Kaggle [SeeFood dataset](https://www.kaggle.com/datasets/dansbecker/hot-dog-not-hot-dog),
-[Food-101](https://data.vision.ee.ethz.ch/cvl/datasets_extra/food-101/), and the LLM provider you connect.
+[CLEF-Flash](https://huggingface.co/Cloudflare/clef-flash) and its
+[4-bit MLX version](https://huggingface.co/mlx-community/clef-flash-4bit) (both Apache-2.0), the ImageNet-pretrained torchvision weights,
+[Food-101](https://data.vision.ee.ethz.ch/cvl/datasets_extra/food-101/), the optional Kaggle
+[SeeFood dataset](https://www.kaggle.com/datasets/dansbecker/hot-dog-not-hot-dog), and the LLM provider you connect.
 The UI is an unofficial parody; all of its artwork is original.

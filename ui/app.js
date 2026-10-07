@@ -12,7 +12,7 @@
       sub: 'Cloudflare · 9B multimodal decision model',
       loading: 'Deliberating with 9B parameters…',
       slowQuip: 'brought more parameters to the table',
-      fix: './run.sh download', fixWhat: 'Downloads the weights (~19 GB).',
+      fix: './run.sh download', fixWhat: 'Downloads the weights (4-bit MLX, ~6 GB, on an Apple Silicon Mac; ~19 GB elsewhere).',
     },
     cnn: {
       id: 'cnn', name: 'CNN', url: CFG.cnn,

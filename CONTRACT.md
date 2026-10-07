@@ -5,7 +5,7 @@ Three model servers speak the same small JSON API; the UI talks only to that. `.
 | Component | Dir | Port | Tech |
 |---|---|---|---|
 | LLM | `llm-server/` | 8003 | FastAPI + any OpenAI-compatible vision chat API (OpenAI, OpenRouter, Ollama, LM Studio …) |
-| CLEF-Flash | `clef-server/` | 8001 | FastAPI + PyTorch, `Cloudflare/clef-flash` (9.4B, Qwen3.5-9B backbone + joint schema head, BF16) |
+| CLEF-Flash | `clef-server/` | 8001 | FastAPI + MLX on Apple Silicon: `mlx-community/clef-flash-4bit` (4-bit quantized); PyTorch elsewhere: `Cloudflare/clef-flash` (BF16). 9.4B, Qwen3.5-9B backbone + joint schema head |
 | CNN | `cnn/` (training notebook + `cnn/server/`) | 8002 | FastAPI + PyTorch, ConvNeXt-Tiny fine-tuned by the notebook |
 | UI | `ui/` | 8080 | static HTML/CSS/JS, no build step |
 
@@ -36,11 +36,14 @@ Response 200:
 ```
 Errors: `400` bad image, `413` upload too large (25 MB CNN/CLEF, 20 MB LLM), `503` loading or not set up (same `detail` as `/health`).
 
+CLEF-Flash's `/health` also reports `backend` (`mlx` | `torch`), `weights` (e.g. `4-bit MLX quantization`) and
+`model_id`; its `device` is `mlx · 4-bit` on a Mac.
+
 The CNN's `/health` also reports `arch`, `weights` (`state_dict` | `torchscript`) and `temperature` (calibration).
 
 ## Cross-cutting rules
 - CORS: only pages served on the UI port (`PORT_UI`, default 8080) may call the servers, so other websites can't.
-- Device auto-select: `DEVICE` overrides; else cuda → mps → cpu.
+- Device auto-select (PyTorch servers): `DEVICE` overrides; else cuda → mps → cpu. CLEF-Flash on Apple Silicon uses MLX instead (`CLEF_BACKEND=torch` to opt out).
 - Servers bind to 127.0.0.1; `LAN=1 ./run.sh` binds 0.0.0.0 so a phone on the same Wi-Fi can use the UI.
 
 ## LLM-specific additions (port 8003, `"model": "llm"`)
