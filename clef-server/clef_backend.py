@@ -1,12 +1,11 @@
-"""CLEF-Flash backends.
+"""CLEF-Flash backends: two ways to run the same 9.4B model, picked by `choose_backend()`.
 
-Two ways to run the same model, picked by `choose_backend()`:
   mlx    mlx-community/clef-flash-4bit: 4-bit MLX quantization, ~6 GB, Apple Silicon (default on a Mac)
   torch  Cloudflare/clef-flash: the full BF16 release, ~19 GB, NVIDIA GPU / CPU (default elsewhere)
 
-Heavy libraries (torch, mlx) are imported lazily so this module imports without them.
+torch and mlx are imported lazily in the loader thread, so this module imports without them
+(run.sh and download_model.py rely on that).
 """
-from __future__ import annotations
 
 import logging
 import os
@@ -14,8 +13,12 @@ import platform
 import sys
 import threading
 import time
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
+
+from PIL import Image
 
 from prompt import ClefPrompt
 
@@ -25,11 +28,16 @@ REPOS = {"mlx": "mlx-community/clef-flash-4bit", "torch": "Cloudflare/clef-flash
 APPROX_GB = {"mlx": 6, "torch": 19}
 DESCRIPTION = {"mlx": "4-bit MLX quantization", "torch": "full BF16 weights"}
 
-_DTYPES = {"bf16": "bfloat16", "bfloat16": "bfloat16",
-           "fp16": "float16", "float16": "float16", "half": "float16",
-           "fp32": "float32", "float32": "float32"}
+_TORCH_DTYPES = {
+    **dict.fromkeys(("bf16", "bfloat16"), "bfloat16"),
+    **dict.fromkeys(("fp16", "float16", "half"), "float16"),
+    **dict.fromkeys(("fp32", "float32"), "float32"),
+}
+
+Probs = dict[str, float]  # {"hotdog": p, "not_hotdog": p}
 
 
+# ------------------------------------------------------------------------------------------ configuration
 def is_apple_silicon() -> bool:
     return sys.platform == "darwin" and platform.machine() == "arm64"
 
@@ -49,9 +57,64 @@ def model_repo(backend: str) -> str:
     return os.environ.get("CLEF_MODEL") or REPOS[backend]
 
 
-def pick_device(torch) -> str:
-    env = os.environ.get("DEVICE", "").strip().lower()
-    if env:
+def make_backend(prompt: ClefPrompt) -> "Backend":
+    kind = choose_backend()
+    backend_cls = MlxBackend if kind == "mlx" else TorchBackend
+    return backend_cls(model_repo(kind), prompt)
+
+
+# ------------------------------------------------------------------------------------------------ weights
+class WeightsMissing(RuntimeError):
+    """The weights are not in the local Hugging Face cache (and auto-download is off)."""
+
+
+def find_local_weights(model: str) -> str | None:
+    """A local dir, or the model's snapshot in the local HF cache (respects HF_HOME); None if neither. No network."""
+    local = Path(model).expanduser()
+    if local.is_dir():
+        return str(local.resolve())
+    from huggingface_hub import snapshot_download
+
+    try:
+        return snapshot_download(model, local_files_only=True)
+    except Exception:  # LocalEntryNotFoundError & co.: simply not downloaded (yet)
+        return None
+
+
+def resolve_model_path(model: str, approx_gb: int = APPROX_GB["torch"]) -> str:
+    """Path to the weights. Never starts a multi-GB download implicitly: `./run.sh download` does that on
+    purpose. CLEF_AUTO_DOWNLOAD=1 allows downloading on server start anyway."""
+    if os.environ.get("CLEF_AUTO_DOWNLOAD") == "1" and not Path(model).expanduser().is_dir():
+        from huggingface_hub import snapshot_download
+
+        log.info("downloading / resolving %s from the Hub (~%s GB on first run)", model, approx_gb)
+        return snapshot_download(model)
+    path = find_local_weights(model)
+    if path is None:
+        raise WeightsMissing(f"CLEF-Flash weights are not downloaded yet — run ./run.sh download (~{approx_gb} GB)")
+    return path
+
+
+def _import_from(path: str) -> None:
+    """Both releases ship their own Python loader next to the weights."""
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+
+def _to_labels(prompt: ClefPrompt, option_probs: Iterable[tuple[Any, float]]) -> Probs:
+    """[(option_id, p), ...] -> {"hotdog": p, "not_hotdog": p} via the schema's label_map."""
+    probs = {"hotdog": 0.0, "not_hotdog": 0.0}
+    for option, p in option_probs:
+        label = prompt.label_map.get(str(option))
+        if label is None:
+            raise RuntimeError(f"unexpected option id from model: {option!r}")
+        probs[label] += float(p)
+    return probs
+
+
+def pick_device(torch: Any) -> str:
+    """DEVICE overrides; otherwise cuda → mps → cpu."""
+    if env := os.environ.get("DEVICE", "").strip().lower():
         return env
     if torch.cuda.is_available():
         return "cuda"
@@ -60,56 +123,23 @@ def pick_device(torch) -> str:
     return "cpu"
 
 
-def _sync(torch, device: str) -> None:
+def _sync(torch: Any, device: str) -> None:
     if device.startswith("cuda"):
         torch.cuda.synchronize()
     elif device == "mps":
         torch.mps.synchronize()
 
 
-class WeightsMissing(RuntimeError):
-    """The weights are not in the local Hugging Face cache (and auto-download is off)."""
+# ----------------------------------------------------------------------------------------------- backends
+class Backend:
+    """Loads the model in the background so /health can answer meanwhile.
 
-
-def resolve_model_path(model: str, approx_gb: int = 19) -> str:
-    """Local dir -> as-is; otherwise the local HF cache (respects HF_HOME).
-
-    Never starts a multi-GB download implicitly: `./run.sh download` does that on purpose.
-    Set CLEF_AUTO_DOWNLOAD=1 to allow downloading on server start anyway.
+    `ready` turns True once the model is loaded and warmed up; `error` explains a failed load
+    (it is the "not set up" detail that /health and /classify report).
     """
-    if Path(model).expanduser().is_dir():
-        return str(Path(model).expanduser().resolve())
-    from huggingface_hub import snapshot_download
-    if os.environ.get("CLEF_AUTO_DOWNLOAD", "0") == "1":
-        log.info("downloading / resolving %s from the Hub (~%s GB on first run)", model, approx_gb)
-        return snapshot_download(model)
-    try:
-        return snapshot_download(model, local_files_only=True)
-    except Exception as e:
-        raise WeightsMissing(
-            f"CLEF-Flash weights are not downloaded yet — run ./run.sh download (~{approx_gb} GB)") from e
 
-
-def make_backend(prompt: ClefPrompt):
-    kind = choose_backend()
-    cls = MlxBackend if kind == "mlx" else ClefBackend
-    return cls(model_repo(kind), prompt)
-
-
-def _to_labels(prompt: ClefPrompt, option_probs) -> dict[str, float]:
-    """[(option_id, p), ...] -> {"hotdog": p, "not_hotdog": p} via the schema's label_map."""
-    result = {"hotdog": 0.0, "not_hotdog": 0.0}
-    for opt, p in option_probs:
-        label = prompt.label_map.get(str(opt))
-        if label is None:
-            raise RuntimeError(f"unexpected option id from model: {opt!r}")
-        result[label] += float(p)
-    return result
-
-
-class _Loader:
-    """Loads the model in the background; /health reports `ready` / `error` meanwhile."""
-    kind = ""
+    kind: str
+    device: str
 
     def __init__(self, model_id: str, prompt: ClefPrompt):
         self.model_id = model_id
@@ -121,172 +151,192 @@ class _Loader:
     def weights(self) -> str:
         return DESCRIPTION[self.kind]
 
+    def start(self) -> None:
+        """Begin loading in the background; returns immediately."""
+        raise NotImplementedError
+
+    def classify(self, image: Image.Image) -> tuple[Probs, float]:
+        """-> (label probabilities, forward-pass latency in ms). Safe to call from any thread."""
+        if not self.ready:
+            raise RuntimeError("model not ready")
+        return self._infer_exclusively(image)
+
+    def _infer_exclusively(self, image: Image.Image) -> tuple[Probs, float]:
+        """`_infer`, one request at a time: there is one model on one accelerator."""
+        raise NotImplementedError
+
+    def _load(self) -> None:
+        raise NotImplementedError
+
+    def _infer(self, image: Image.Image) -> tuple[Probs, float]:
+        raise NotImplementedError
+
     def _load_safe(self) -> None:
         try:
             self._load()
         except WeightsMissing as e:  # expected before `./run.sh download`; no traceback spam
             log.warning("%s", e)
             self.error = str(e)
-        except Exception as e:  # surfaced via /health
+        except Exception as e:
             log.exception("model load failed")
             self.error = f"{type(e).__name__}: {e}"
 
-    def _load(self) -> None:
-        raise NotImplementedError
+    def _warmup(self) -> None:
+        """A tiny forward pass: compiles kernels and surfaces dtype/device problems before the first request."""
+        self._infer(Image.new("RGB", (64, 64), (128, 128, 128)))
 
 
-class ClefBackend(_Loader):
-    """Full-size PyTorch release (Cloudflare/clef-flash): CUDA, MPS or CPU."""
+class TorchBackend(Backend):
+    """The full-size PyTorch release (Cloudflare/clef-flash) on CUDA, MPS or CPU."""
+
     kind = "torch"
 
     def __init__(self, model_id: str, prompt: ClefPrompt):
         super().__init__(model_id, prompt)
-        self.device = os.environ.get("DEVICE", "") or "pending"
-        self.dtype_name = _DTYPES.get(os.environ.get("DTYPE", "bf16").lower(), "bfloat16")
+        self.device = os.environ.get("DEVICE") or "pending"
+        self.dtype_name = _TORCH_DTYPES.get(os.environ.get("DTYPE", "bf16").lower(), "bfloat16")
         self._lock = threading.Lock()
-        self._torch = None
-        self._model = None
-        self._processor = None
-        self._encode = None
-        self._collate = None
+        self._torch: Any = None
+        self._model: Any = None
+        self._processor: Any = None
+        self._encode: Any = None
+        self._collate: Any = None
 
-    # ---------------------------------------------------------------- loading
     def start(self) -> None:
         threading.Thread(target=self._load_safe, name="clef-loader", daemon=True).start()
 
+    def _infer_exclusively(self, image: Image.Image) -> tuple[Probs, float]:
+        with self._lock:
+            return self._infer(image)
+
     def _load(self) -> None:
         import torch
+
         self._torch = torch
         self.device = pick_device(torch)
         path = resolve_model_path(self.model_id, APPROX_GB[self.kind])
-        if path not in sys.path:
-            sys.path.insert(0, path)
+        _import_from(path)
         from joint_schema_model import collate_records, encode_record, load_release_model
-        self._encode, self._collate = encode_record, collate_records
 
+        self._encode, self._collate = encode_record, collate_records
         dtype = getattr(torch, self.dtype_name)
         try:
-            self._load_and_warmup(load_release_model, path, dtype)
+            self._load_weights(load_release_model, path, dtype)
         except Exception as e:
-            # MPS bf16 support is patchy (older macOS / some kernels) -> retry fp16.
-            if self.device == "mps" and dtype == torch.bfloat16:
-                log.warning("bf16 on mps failed (%s); retrying in fp16", e)
-                self._model = None
-                torch.mps.empty_cache()
-                self.dtype_name = "float16"
-                self._load_and_warmup(load_release_model, path, torch.float16)
-            else:
+            if self.device != "mps" or dtype != torch.bfloat16:
                 raise
+            # MPS bf16 support is patchy (older macOS, some kernels): retry in fp16.
+            log.warning("bf16 on mps failed (%s); retrying in fp16", e)
+            self._model = None
+            torch.mps.empty_cache()
+            self.dtype_name = "float16"
+            self._load_weights(load_release_model, path, torch.float16)
         self.ready = True
         log.info("CLEF-Flash ready on %s (%s)", self.device, self.dtype_name)
 
-    def _load_and_warmup(self, load_release_model, path: str, dtype) -> None:
-        t = time.perf_counter()
+    def _load_weights(self, load_release_model: Callable, path: str, dtype: Any) -> None:
+        started = time.perf_counter()
         self._model, self._processor = load_release_model(path, device=self.device, dtype=dtype)
         self._model.eval()
-        log.info("weights loaded in %.1fs", time.perf_counter() - t)
-        from PIL import Image
-        self._infer(Image.new("RGB", (64, 64), (128, 128, 128)))  # warmup / dtype check
+        log.info("weights loaded in %.1fs", time.perf_counter() - started)
+        self._warmup()  # part of the load so a failing dtype triggers the fp16 retry
 
-    # -------------------------------------------------------------- inference
-    def _infer(self, image) -> tuple[dict[str, float], float]:
+    def _infer(self, image: Image.Image) -> tuple[Probs, float]:
         torch = self._torch
-        tok = self._processor.tokenizer
-        record = self.prompt.record([image])
-        encoded = self._encode(tok, record, processor=self._processor)
-        batch = self._collate([encoded], tok.pad_token_id, torch.device(self.device))
-
-        qid = self.prompt.question_id
-        q_index, option_ids = _find_question(encoded, qid)
+        tokenizer = self._processor.tokenizer
+        encoded = self._encode(tokenizer, self.prompt.record([image]), processor=self._processor)
+        batch = self._collate([encoded], tokenizer.pad_token_id, torch.device(self.device))
+        q_index, option_ids = _find_question(encoded, self.prompt.question_id)
 
         with torch.inference_mode():
-            _sync(torch, self.device)
-            t0 = time.perf_counter()
+            _sync(torch, self.device)  # time the forward pass only, not queued async work
+            started = time.perf_counter()
             out = self._model(batch)
             _sync(torch, self.device)
-            latency_ms = (time.perf_counter() - t0) * 1000.0
+            latency_ms = (time.perf_counter() - started) * 1000.0
 
-        per_question = out[0]                 # list over questions (batch of 1)
-        logits = per_question[q_index].float().reshape(-1)
+        logits = out[0][q_index].float().reshape(-1)  # out: per sample (batch of 1) -> per question
         if logits.numel() != len(option_ids):
             raise RuntimeError(f"logit/option mismatch: {logits.numel()} vs {option_ids}")
         probs = logits.softmax(-1).cpu().tolist()
-
-        return _to_labels(self.prompt, zip(option_ids, probs)), latency_ms
-
-    def classify(self, image) -> tuple[dict[str, float], float]:
-        if not self.ready:
-            raise RuntimeError("model not ready")
-        with self._lock:  # single GPU: serialize
-            return self._infer(image)
+        return _to_labels(self.prompt, zip(option_ids, probs, strict=True)), latency_ms
 
 
-def _find_question(encoded, qid: str) -> tuple[int, list]:
-    """Return (index, option_ids) of our question in the encoded record.
-    Defensive about the exact shape of encoded.questions."""
-    questions = getattr(encoded, "questions", None)
-    if questions is None and isinstance(encoded, dict):
-        questions = encoded["questions"]
+_QUESTION_NAME_KEYS = ("question_id", "name", "id", "key")
+
+
+def _find_question(encoded: Any, question_id: str) -> tuple[int, list]:
+    """(index, option_ids) of our question in the encoded record.
+
+    Defensive about its exact shape: the record and its questions may be dicts or objects.
+    """
+    questions = _field(encoded, "questions")
+    if questions is None:
+        raise RuntimeError("encoded record has no questions")
     if isinstance(questions, dict):
-        questions = list(questions.values())
-    for i, q in enumerate(questions):
-        get = (lambda k: q.get(k)) if isinstance(q, dict) else (lambda k: getattr(q, k, None))
-        name = get("question_id") or get("name") or get("id") or get("key")
-        if name is None or name == qid:
-            opts = get("option_ids")
-            if opts is None:
+        questions = questions.values()
+    for index, question in enumerate(questions):
+        name = next(filter(None, (_field(question, key) for key in _QUESTION_NAME_KEYS)), None)
+        if name is None or name == question_id:
+            option_ids = _field(question, "option_ids")
+            if option_ids is None:
                 raise RuntimeError("encoded question has no option_ids")
-            return i, list(opts)
-    raise RuntimeError(f"question {qid!r} not found in encoded record")
+            return index, list(option_ids)
+    raise RuntimeError(f"question {question_id!r} not found in encoded record")
 
 
-class MlxBackend(_Loader):
-    """4-bit MLX quantization (mlx-community/clef-flash-4bit) for Apple Silicon.
+def _field(obj: Any, name: str) -> Any:
+    return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+
+
+class MlxBackend(Backend):
+    """The 4-bit MLX quantization (mlx-community/clef-flash-4bit) for Apple Silicon.
 
     The repo ships its own loader, clef_mlx.py: `clef_mlx.load(path).predict(record)` returns
     {question_id: {option_id: probability}} from a single forward pass.
-    All MLX work runs on one dedicated thread: MLX streams belong to the thread that created them.
+    All MLX work runs on one dedicated thread because MLX streams belong to the thread that created them.
     """
+
     kind = "mlx"
 
     def __init__(self, model_id: str, prompt: ClefPrompt):
         super().__init__(model_id, prompt)
         self.device = "mlx · 4-bit"
-        self._model = None
+        self._model: Any = None
         self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="clef-mlx")
 
     def start(self) -> None:
         self._worker.submit(self._load_safe)
 
+    def _infer_exclusively(self, image: Image.Image) -> tuple[Probs, float]:
+        return self._worker.submit(self._infer, image).result()  # the single MLX thread also serializes
+
     def _load(self) -> None:
-        path = resolve_model_path(self.model_id, APPROX_GB[self.kind])  # first: "not set up" works anywhere
-        if path not in sys.path:
-            sys.path.insert(0, path)
+        # Resolve first, so "not set up" is reported the same way on any machine.
+        path = resolve_model_path(self.model_id, APPROX_GB[self.kind])
+        _import_from(path)
         try:
             import clef_mlx
         except ImportError as e:
-            hint = ("run ./run.sh setup to install mlx-vlm" if is_apple_silicon()
-                    else "MLX needs an Apple Silicon Mac; elsewhere use CLEF_BACKEND=torch")
+            hint = (
+                "run ./run.sh setup to install mlx-vlm"
+                if is_apple_silicon()
+                else "MLX needs an Apple Silicon Mac; elsewhere use CLEF_BACKEND=torch"
+            )
             raise RuntimeError(f"cannot load the MLX model ({e}); {hint}") from e
-        t = time.perf_counter()
+        started = time.perf_counter()
         self._model = clef_mlx.load(path)
-        log.info("weights loaded in %.1fs", time.perf_counter() - t)
-        from PIL import Image
-        self._infer(Image.new("RGB", (64, 64), (128, 128, 128)))  # warmup: compiles the kernels
+        log.info("weights loaded in %.1fs", time.perf_counter() - started)
+        self._warmup()
         self.ready = True
         log.info("CLEF-Flash ready on MLX (%s)", self.weights)
 
-    def _infer(self, image) -> tuple[dict[str, float], float]:
+    def _infer(self, image: Image.Image) -> tuple[Probs, float]:
         record = self.prompt.record([image])
-        t0 = time.perf_counter()
-        out = self._model.predict(record)  # returns Python floats, so the GPU work is done here
-        latency_ms = (time.perf_counter() - t0) * 1000.0
-        qid = self.prompt.question_id
-        if qid not in out:
-            raise RuntimeError(f"question {qid!r} missing from model output {list(out)}")
-        return _to_labels(self.prompt, out[qid].items()), latency_ms
-
-    def classify(self, image) -> tuple[dict[str, float], float]:
-        if not self.ready:
-            raise RuntimeError("model not ready")
-        return self._worker.submit(self._infer, image).result()  # one at a time, on the MLX thread
+        started = time.perf_counter()
+        out = self._model.predict(record)  # returns Python floats, so the GPU work is finished here
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        question_id = self.prompt.question_id
+        if question_id not in out:
+            raise RuntimeError(f"question {question_id!r} missing from model output {list(out)}")
+        return _to_labels(self.prompt, out[question_id].items()), latency_ms

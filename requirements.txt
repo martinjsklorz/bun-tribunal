@@ -1,5 +1,7 @@
-# Everything run.sh installs, if you prefer to manage your own environment:
+# Everything ./run.sh installs into .venv (it reads the -r lines below, and reinstalls when any of
+# those files change). To manage your own environment instead:
 #   pip install -r requirements.txt
 -r clef-server/requirements.txt
 -r cnn/requirements.txt
 -r llm-server/requirements.txt
+# Not installed by run.sh: the linter/formatter configured in pyproject.toml (`pip install ruff`).
