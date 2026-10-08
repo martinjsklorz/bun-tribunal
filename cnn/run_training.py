@@ -10,6 +10,7 @@ Used by `./run.sh train`. Executes the notebook top to bottom (same code as clic
 Configuration comes from environment variables the notebook reads
 (ARCH, ADD_FOOD101, DATA_SOURCE, DEVICE, SMOKE, CNN_ARTIFACTS, DATA_DIR).
 """
+
 from __future__ import annotations
 
 import os
@@ -38,42 +39,60 @@ class LiveClient(NotebookClient):
         return super().process_message(msg, cell, cell_index)
 
 
-def main() -> int:
-    out_dir = Path(os.environ.get("CNN_ARTIFACTS", HERE / "artifacts"))
-    if not out_dir.is_absolute():
-        out_dir = HERE / out_dir
+def artifacts_dir() -> Path:
+    """CNN_ARTIFACTS (relative to cnn/, like the notebook and server), created if needed."""
+    out_dir = HERE / os.environ.get("CNN_ARTIFACTS", "artifacts")  # an absolute value replaces HERE
     out_dir.mkdir(parents=True, exist_ok=True)
-    os.environ["CNN_ARTIFACTS"] = str(out_dir)
-    report_nb, report_html = out_dir / "training_report.ipynb", out_dir / "training_report.html"
+    return out_dir
 
-    nb = nbformat.read(NOTEBOOK, as_version=4)
-    client = LiveClient(nb, timeout=None, kernel_name="python3", allow_errors=False,
-                        resources={"metadata": {"path": str(HERE)}})
-    t0, ok, interrupted = time.time(), True, False
+
+def run_notebook(nb: nbformat.NotebookNode) -> int:
+    """Execute `nb` in place; returns the process exit code (0 ok, 1 cell error, 130 Ctrl-C)."""
+    client = LiveClient(
+        nb, timeout=None, kernel_name="python3", allow_errors=False, resources={"metadata": {"path": str(HERE)}}
+    )
     try:
         client.execute()
     except CellExecutionError:
-        ok = False
+        return 1
     except KeyboardInterrupt:
         print("\nInterrupted.")
-        ok, interrupted = False, True
-    finally:
-        nbformat.write(nb, report_nb)
-        try:
-            from nbconvert import HTMLExporter
-            html, _ = HTMLExporter().from_notebook_node(nb)
-            report_html.write_text(html, encoding="utf-8")
-        except Exception as e:  # the HTML report is a nice-to-have
-            print(f"(could not write HTML report: {e})")
+        return 130
+    return 0
 
-    mins = (time.time() - t0) / 60
+
+def write_reports(nb: nbformat.NotebookNode, report_nb: Path, report_html: Path) -> None:
+    nbformat.write(nb, report_nb)
+    try:
+        from nbconvert import HTMLExporter
+
+        html, _ = HTMLExporter().from_notebook_node(nb)
+        report_html.write_text(html, encoding="utf-8")
+    except Exception as e:  # the HTML report is a nice-to-have
+        print(f"(could not write HTML report: {e})")
+
+
+def main() -> int:
+    out_dir = artifacts_dir()
+    os.environ["CNN_ARTIFACTS"] = str(out_dir)  # inherited by the notebook kernel
+    report_html = out_dir / "training_report.html"
+
+    nb = nbformat.read(NOTEBOOK, as_version=4)
+    t0 = time.monotonic()
+    rc = 1
+    try:
+        rc = run_notebook(nb)
+    finally:  # also keep the partial report when something unexpected blows up
+        write_reports(nb, out_dir / "training_report.ipynb", report_html)
+
+    mins = (time.monotonic() - t0) / 60
     print()
-    if ok:
+    if rc == 0:
         print(f"Training finished in {mins:.1f} min.")
     else:
         print(f"Training stopped after {mins:.1f} min (see the error above).")
     print(f"Full report with all plots: {report_html}")
-    return 0 if ok else (130 if interrupted else 1)
+    return rc
 
 
 if __name__ == "__main__":

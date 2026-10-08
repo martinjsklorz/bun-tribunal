@@ -1,13 +1,21 @@
+# Python
 .venv/
 __pycache__/
-.pytest_cache/
 *.pyc
-cnn/artifacts/*
-!cnn/artifacts/.gitkeep
-cnn/data/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Created by ./run.sh: logs, remembered "don't ask again" answers, LLM settings (contain the API key)
 logs/
 .run-prefs
 llm-server/.env
 llm-server/.env.bak
+
+# CNN training: downloaded datasets and the trained model (large, machine-specific)
+cnn/data/
+cnn/artifacts/*
+!cnn/artifacts/.gitkeep
+
+# OS
 .DS_Store
-.ipynb_checkpoints/

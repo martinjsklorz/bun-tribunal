@@ -11,6 +11,10 @@
 #   ./run.sh help       this help   (LAN=1 ./run.sh to try it on your phone)
 #
 # Works with macOS' built-in bash 3.2. Needs Python >= 3.11 (python.org, Homebrew or pyenv).
+
+# Maintainer notes: bash 3.2 means no associative arrays, ${var,,}, mapfile or `wait -n`, and an empty
+# array is "unbound" under `set -u`, so lists below are plain space-separated strings. Check changes with
+# `shellcheck -s bash run.sh`. The comment block above is the help text (`./run.sh help` prints it).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -18,9 +22,14 @@ cd "$ROOT"
 VENV="${VENV:-$ROOT/.venv}"
 PY="$VENV/bin/python"
 LOGS="$ROOT/logs"
-PREFS="$ROOT/.run-prefs"          # remembers "don't ask again" answers
+PREFS="$ROOT/.run-prefs"          # remembers "don't ask again" answers, one per line
 export PORT_LLM=8003 PORT_CLEF=8001 PORT_CNN=8002 PORT_UI="${PORT_UI:-8080}"   # PORT_UI=9090 ./run.sh if 8080 is taken
 UI_URL="http://localhost:$PORT_UI"
+
+# Python packages. The full set is whatever the root requirements.txt pulls in with `-r`;
+# the light set is just what the LLM wizard needs (no PyTorch), so `./run.sh llm` is quick on a fresh checkout.
+REQS_ROOT="requirements.txt"
+REQS_LIGHT="llm-server/requirements.txt"
 
 # ------------------------------------------------------------------ output helpers
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -33,26 +42,31 @@ step() { printf '\n%s==> %s%s\n' "$B" "$*" "$RST"; }
 ok()   { printf '  %s✓%s %s\n' "$GRN" "$RST" "$*"; }
 warn() { printf '  %s!%s %s\n' "$YEL" "$RST" "$*"; }
 die()  { printf '\n%s✗ %s%s\n' "$RED" "$*" "$RST" >&2; exit 1; }
+interrupted() { printf '\n%s✗ %s%s\n' "$YEL" "$*" "$RST" >&2; exit 130; }   # Ctrl+C: exit like bash does
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }   # bash 3.2 has no ${var,,}
+is_mac() { [ "$(uname -s)" = "Darwin" ]; }
 
+# ------------------------------------------------------------------ questions + remembered answers
 interactive() { [ -t 0 ] && [ -t 1 ] && [ "${NONINTERACTIVE:-0}" != "1" ]; }
 
-# ask "Question" Y|N  -> returns 0 for yes. Non-interactive: takes the default.
+# ask "Question" Y|N -> 0 for yes. Non-interactive: takes the default without asking.
 ask() {
   local q="$1" def="${2:-N}" hint ans
-  [ "$def" = "Y" ] && hint="[Y/n]" || hint="[y/N]"
+  if [ "$def" = "Y" ]; then hint="[Y/n]"; else hint="[y/N]"; fi
   if ! interactive; then [ "$def" = "Y" ]; return; fi
   printf '  %s?%s %s %s ' "$CYN" "$RST" "$q" "$hint"
   read -r ans || ans=""
-  ans="$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')"
-  [ -z "$ans" ] && ans="$(printf '%s' "$def" | tr '[:upper:]' '[:lower:]')"
+  ans="$(lower "${ans:-$def}")"
   [ "$ans" = "y" ] || [ "$ans" = "yes" ]
 }
-prompt() {  # prompt "Label" "default" -> echo answer
+# prompt "Label" "default" -> prints the answer (the question itself goes to stderr, so $(prompt ...) works)
+prompt() {
   local label="$1" def="${2:-}" ans
   if [ -n "$def" ]; then printf '  %s %s[%s]%s: ' "$label" "$DIM" "$def" "$RST" >&2; else printf '  %s: ' "$label" >&2; fi
   read -r ans || ans=""
   printf '%s' "${ans:-$def}"
 }
+# prompt_secret "Label" -> like prompt, but without echoing what is typed
 prompt_secret() {
   local label="$1" ans
   printf '  %s: ' "$label" >&2
@@ -60,8 +74,8 @@ prompt_secret() {
   printf '\n' >&2
   printf '%s' "$ans"
 }
-pref_set()  { touch "$PREFS"; grep -qx "$1" "$PREFS" 2>/dev/null || echo "$1" >> "$PREFS"; }
-pref_has()  { [ -f "$PREFS" ] && grep -qx "$1" "$PREFS"; }
+pref_set() { touch "$PREFS"; grep -qx "$1" "$PREFS" || echo "$1" >> "$PREFS"; }
+pref_has() { [ -f "$PREFS" ] && grep -qx "$1" "$PREFS"; }
 
 # ------------------------------------------------------------------ python + venv
 find_python() {
@@ -74,53 +88,69 @@ find_python() {
   return 1
 }
 
-# ensure_env full|light  (light = just what the LLM wizard needs, no PyTorch)
+# req_files full|light -> the requirement files whose content decides whether to reinstall
+req_files() {
+  if [ "$1" = "light" ]; then echo "$REQS_LIGHT"
+  else sed -n 's/^-r[[:space:]]*//p' "$REQS_ROOT" | tr -d '\r'; fi
+}
+# req_hash full|light -> checksum of those files (plus any direct requirement lines in the root file)
+req_hash() {
+  local files; files="$(req_files "$1")"
+  {
+    # shellcheck disable=SC2086  # $files is a space/newline-separated list of paths
+    cat $files
+    [ "$1" = "light" ] || grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*-r' -e '^[[:space:]]*$' "$REQS_ROOT" || true
+  } | cksum | cut -d' ' -f1
+}
+stamp_ok() { [ -f "$VENV/.stamp-$1" ] && [ "$(cat "$VENV/.stamp-$1")" = "$(req_hash "$1")" ]; }
+
+# ensure_env full|light: create .venv if needed and (re)install packages when the requirements changed.
+# Remembers what it already checked, so nested commands (the setup wizard runs llm/train/download)
+# don't hash or pip-install twice in one run, even with FORCE_INSTALL=1.
+ENV_DONE=""
 ensure_env() {
-  local mode="$1" reqs stamp hash base
+  local mode="$1" base args
+  [ "$ENV_DONE" = "full" ] && return 0
+  [ "$ENV_DONE" = "$mode" ] && return 0
   if [ ! -x "$PY" ]; then
     base="$(find_python)" || die "Python 3.11 or newer is required. Install it (e.g. 'brew install python@3.12') and run ./run.sh again."
-    step "Creating a Python environment in ${VENV#"$ROOT"/} ($("$base" -V))"
-    "$base" -m venv "$VENV"
-    "$PY" -m pip install --quiet --upgrade pip
+    step "Creating a Python environment in ${VENV#"$ROOT"/} ($("$base" -V 2>&1))"
+    # A venv whose Python has gone away (e.g. after a Homebrew upgrade) is rebuilt from scratch.
+    args=""; [ -f "$VENV/pyvenv.cfg" ] && args="--clear"
+    # shellcheck disable=SC2086  # $args is empty or one flag
+    "$base" -m venv $args "$VENV" \
+      || die "Could not create $VENV. On Debian/Ubuntu: sudo apt install python3-venv, then run ./run.sh again."
+    "$PY" -m pip install --quiet --upgrade pip || die "Could not update pip in the new environment (see above)."
   fi
-  if [ "$mode" = "light" ]; then
-    # A full install also covers the light set.
-    [ -f "$VENV/.stamp-full" ] && [ "$(cat "$VENV/.stamp-full")" = "$(req_hash full)" ] && return 0
-    reqs="llm-server/requirements.txt"
-  else
-    reqs="clef-server/requirements.txt cnn/requirements.txt llm-server/requirements.txt"
-  fi
-  stamp="$VENV/.stamp-$mode"; hash="$(req_hash "$mode")"
-  if [ ! -f "$stamp" ] || [ "$(cat "$stamp")" != "$hash" ] || [ "${FORCE_INSTALL:-0}" = "1" ]; then
+  # A full install covers the light set too.
+  if [ "$mode" = "light" ] && stamp_ok full && [ "${FORCE_INSTALL:-0}" != "1" ]; then ENV_DONE=full; return 0; fi
+  if ! stamp_ok "$mode" || [ "${FORCE_INSTALL:-0}" = "1" ]; then
     if [ "$mode" = "full" ]; then
       step "Installing Python packages (PyTorch, MLX on Apple Silicon, transformers, FastAPI, …): a few minutes the first time"
+      # Big download: show pip's progress.
+      "$PY" -m pip install --disable-pip-version-check -r "$REQS_ROOT" || die "Package installation failed (see above). Fix the cause and run ./run.sh again."
     else
       step "Installing the LLM packages"
+      "$PY" -m pip install --quiet --disable-pip-version-check -r "$REQS_LIGHT" || die "Package installation failed (see above). Fix the cause and run ./run.sh again."
     fi
-    local args="" quiet="--quiet"; for r in $reqs; do args="$args -r $r"; done
-    [ "$mode" = "full" ] && quiet=""   # big download: show pip's progress
-    # shellcheck disable=SC2086
-    "$PY" -m pip install $quiet --disable-pip-version-check $args || die "Package installation failed (see above)."
-    echo "$hash" > "$stamp"
+    req_hash "$mode" > "$VENV/.stamp-$mode"
     ok "packages installed"
   fi
-}
-req_hash() {
-  local files
-  if [ "$1" = "light" ]; then files="llm-server/requirements.txt"
-  else files="clef-server/requirements.txt cnn/requirements.txt llm-server/requirements.txt"; fi
-  # shellcheck disable=SC2086
-  cat $files | cksum | cut -d' ' -f1
+  ENV_DONE="$mode"
 }
 
 # ------------------------------------------------------------------ state checks
 llm_configured()  { [ -f llm-server/.env ] || [ -n "${LLM_API_KEY:-}${OPENAI_API_KEY:-}${LLM_BASE_URL:-}" ]; }
+# env_value KEY -> its value in llm-server/.env (last one wins; quotes and trailing comments stripped)
+env_value() { [ -f llm-server/.env ] && sed -n "s/^$1=//p" llm-server/.env | tail -1 | sed 's/[[:space:]]#.*//' | tr -d '"'"'" || true; }
 llm_summary() {   # "model via base URL" for status output
   local m b; m="$(env_value LLM_MODEL)"; b="$(env_value LLM_BASE_URL)"
-  m="${m:-${LLM_MODEL:-gpt-4o-mini}}"; b="${b:-${LLM_BASE_URL:-https://api.openai.com/v1}}"
-  echo "$m via $b"
+  echo "${m:-${LLM_MODEL:-gpt-4o-mini}} via ${b:-${LLM_BASE_URL:-https://api.openai.com/v1}}"
 }
 cnn_trained()     { [ -f cnn/artifacts/model_meta.json ] && ls cnn/artifacts/hotdog_cnn*.pt >/dev/null 2>&1; }
+cnn_summary() {   # "arch · test accuracy 97.1% · date" from model_meta.json
+  "$PY" -c "import json; m=json.load(open('cnn/artifacts/model_meta.json')); t=m.get('metrics',{}); print(m.get('arch','?'), '· test accuracy', format(t.get('test_acc',0),'.1%'), '·', m.get('trained_at','')[:10])" 2>/dev/null || echo "yes"
+}
 clef_downloaded() { [ -x "$PY" ] && (cd clef-server && "$PY" download_model.py --check >/dev/null 2>&1); }
 # Which CLEF-Flash weights this machine uses: "mlx" (4-bit, Apple Silicon) or "torch" (full BF16). Asks Python,
 # so a Rosetta shell on an M-series Mac still gets the right answer; falls back to uname before the venv exists.
@@ -128,23 +158,23 @@ clef_backend() {
   local b=""
   [ -x "$PY" ] && b="$(cd clef-server && "$PY" -c 'import clef_backend as c; print(c.choose_backend())' 2>/dev/null || true)"
   if [ -z "$b" ]; then
-    case "${CLEF_BACKEND:-auto}" in mlx|torch) b="$CLEF_BACKEND" ;;
-      *) if [ "$(uname -s)" = "Darwin" ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = "1" ]; then b=mlx; else b=torch; fi ;;
+    case "${CLEF_BACKEND:-auto}" in
+      mlx|torch) b="$CLEF_BACKEND" ;;
+      *) if is_mac && [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = "1" ]; then b=mlx; else b=torch; fi ;;
     esac
   fi
   echo "$b"
 }
 clef_size() { if [ "$(clef_backend)" = "mlx" ]; then echo "~6 GB"; else echo "~19 GB"; fi; }
-env_value()       { [ -f llm-server/.env ] && sed -n "s/^$1=//p" llm-server/.env | tail -1 | sed 's/[[:space:]]#.*//' | tr -d '"'"'" || true; }
 ram_gb() {
-  if [ "$(uname)" = "Darwin" ]; then echo $(( $(sysctl -n hw.memsize) / 1073741824 ))
+  if is_mac; then echo $(( $(sysctl -n hw.memsize) / 1073741824 ))
   elif [ -r /proc/meminfo ]; then awk '/MemTotal/ {print int($2/1048576)}' /proc/meminfo
   else echo 0; fi
 }
 
 # ------------------------------------------------------------------ ./run.sh llm
 cmd_llm() {
-  interactive || die "./run.sh llm needs an interactive terminal (or write llm-server/.env yourself, see .env.example)."
+  interactive || die "./run.sh llm needs an interactive terminal (or write llm-server/.env yourself, see llm-server/.env.example)."
   ensure_env light
   step "Configure the LLM contender"
   say "  Any vision-capable chat model behind an OpenAI-compatible API works."
@@ -155,7 +185,7 @@ cmd_llm() {
   say "    4) LM Studio       fully local and free"
   say "    5) Other           any OpenAI-compatible endpoint"
   say ""
-  local choice base key model
+  local choice base key model max_tokens=512
   choice="$(prompt 'Choose 1-5' '1')"
   case "$choice" in
     1) base="https://api.openai.com/v1"; model="gpt-4o-mini"
@@ -170,13 +200,12 @@ cmd_llm() {
        say "  In LM Studio: load a vision model and start the local server." ;;
     5) base="$(prompt 'Base URL (ends in /v1)' '')"; model=""
        key="$(prompt_secret 'API key (leave empty if none)')" ;;
-    *) die "Please choose 1-5." ;;
+    *) die "Please choose a number from 1 to 5 (you typed '$choice'). Run ./run.sh llm again." ;;
   esac
   model="$(prompt 'Model' "$model")"
-  [ -n "$base" ] && [ -n "$model" ] || die "Base URL and model are required."
+  [ -n "$base" ] && [ -n "$model" ] || die "Base URL and model are required. Run ./run.sh llm again."
 
-  local max_tokens=512
-  case "$(printf '%s' "$model" | tr '[:upper:]' '[:lower:]')" in
+  case "$(lower "$model")" in
     *reason*|*think*|*r1*|o1*|o3*|o4*|*/o1*|*/o3*|*/o4*|*gpt-5*) max_tokens=2000
       warn "looks like a reasoning model: allowing it 2000 tokens to think" ;;
   esac
@@ -184,7 +213,7 @@ cmd_llm() {
     cp llm-server/.env llm-server/.env.bak && chmod 600 llm-server/.env.bak
     ok "previous settings saved to llm-server/.env.bak"
   fi
-  touch llm-server/.env && chmod 600 llm-server/.env   # the API key is only readable by you
+  touch llm-server/.env && chmod 600 llm-server/.env   # restrict before the key is written: only readable by you
   cat > llm-server/.env <<EOF
 # Written by ./run.sh llm. Edit freely; see .env.example for all options.
 LLM_BASE_URL=$base
@@ -195,7 +224,7 @@ EOF
   ok "saved llm-server/.env (only readable by you)"
 
   step "Checking the connection"
-  if (cd "$ROOT" && "$PY" scripts/llm_check.py); then
+  if "$PY" scripts/llm_check.py; then
     if ask "Send one small test picture to the model? (costs a fraction of a cent, free locally)" Y; then
       "$PY" scripts/llm_check.py --classify || warn "the test call failed. Fix the settings and run ./run.sh llm again."
     fi
@@ -210,37 +239,41 @@ kaggle_ready() {
   [ -f "$HOME/.kaggle/kaggle.json" ] || [ -f "$HOME/.kaggle/access_token" ] \
     || [ -n "${KAGGLE_API_TOKEN:-}" ] || { [ -n "${KAGGLE_USERNAME:-}" ] && [ -n "${KAGGLE_KEY:-}" ]; }
 }
+# Asks for a Kaggle API token and saves it where the kaggle/kagglehub clients look for it.
+ask_kaggle_token() {
+  local token user
+  say "  The hot dog dataset comes from Kaggle, which needs a free account and an API token:"
+  say "    sign in at https://www.kaggle.com  →  Settings  →  API  →  create a new token"
+  say "  Paste the token below. (Older kaggle.json? Paste its \"key\" value; you'll be asked for the username.)"
+  interactive || die "Kaggle credentials missing (~/.kaggle/access_token or ~/.kaggle/kaggle.json). Run ./run.sh train in a terminal to enter them."
+  token="$(prompt_secret 'Kaggle API token')"
+  [ -n "$token" ] || die "No token entered. Run ./run.sh train again when you have one."
+  mkdir -p "$HOME/.kaggle" && chmod 700 "$HOME/.kaggle"
+  if printf '%s' "$token" | grep -qE '^[0-9a-f]{32}$'; then   # legacy 32-hex key -> kaggle.json
+    user="$(prompt 'Kaggle username' '')"
+    [ -n "$user" ] || die "The username is needed with a legacy key. Run ./run.sh train again."
+    printf '{"username":"%s","key":"%s"}\n' "$user" "$token" > "$HOME/.kaggle/kaggle.json"
+    chmod 600 "$HOME/.kaggle/kaggle.json"; ok "saved ~/.kaggle/kaggle.json"
+  else
+    printf '%s\n' "$token" > "$HOME/.kaggle/access_token"
+    chmod 600 "$HOME/.kaggle/access_token"; ok "saved ~/.kaggle/access_token"
+  fi
+}
 cmd_train() {
   ensure_env full
   step "Train the CNN (ConvNeXt-Tiny on Food-101)"
+  # Only the Kaggle data source needs an account; the default (food101) and SMOKE runs don't.
   if [ "${SMOKE:-0}" != "1" ] && [ "${DATA_SOURCE:-food101}" = "kaggle" ] && ! kaggle_ready; then
-    say "  The hot dog dataset comes from Kaggle, which needs a free account and an API token:"
-    say "    sign in at https://www.kaggle.com  →  Settings  →  API  →  create a new token"
-    say "  Paste the token below. (Older kaggle.json? Paste its \"key\" value; you'll be asked for the username.)"
-    interactive || die "Kaggle credentials missing (~/.kaggle/access_token or ~/.kaggle/kaggle.json)."
-    local token user
-    token="$(prompt_secret 'Kaggle API token')"
-    [ -n "$token" ] || die "No token entered. Run ./run.sh train again when you have one."
-    mkdir -p "$HOME/.kaggle" && chmod 700 "$HOME/.kaggle"
-    if printf '%s' "$token" | grep -qE '^[0-9a-f]{32}$'; then   # legacy 32-hex key -> kaggle.json
-      user="$(prompt 'Kaggle username' '')"
-      [ -n "$user" ] || die "The username is needed with a legacy key."
-      printf '{"username":"%s","key":"%s"}\n' "$user" "$token" > "$HOME/.kaggle/kaggle.json"
-      chmod 600 "$HOME/.kaggle/kaggle.json"; ok "saved ~/.kaggle/kaggle.json"
-    else
-      printf '%s\n' "$token" > "$HOME/.kaggle/access_token"
-      chmod 600 "$HOME/.kaggle/access_token"; ok "saved ~/.kaggle/access_token"
-    fi
+    ask_kaggle_token
   fi
   say "  What happens: download datasets (one-time, ~5 GB of Food-101 into cnn/data/), fine-tune,"
   say "  evaluate, export to cnn/artifacts/. Roughly 15–25 min on an Apple Silicon Mac."
-  if [ "$(uname)" = "Darwin" ]; then say "  Keep the lid open; the Mac is kept awake while training."; fi
+  is_mac && say "  Keep the lid open; the Mac is kept awake while training."
   if cnn_trained && ! ask "A trained model already exists. Train a new one (it will replace it)?" N; then return 0; fi
-  local runner=( "$PY" run_training.py )
-  command -v caffeinate >/dev/null 2>&1 && runner=( caffeinate -i "${runner[@]}" )
-  local rc=0
+  local runner=( "$PY" run_training.py ) rc=0
+  command -v caffeinate >/dev/null 2>&1 && runner=( caffeinate -i "${runner[@]}" )   # macOS: no sleep while training
   (cd cnn && "${runner[@]}") || rc=$?
-  [ "$rc" = "130" ] && die "Training interrupted. Run ./run.sh train to start again."
+  [ "$rc" = "130" ] && interrupted "Training interrupted. Run ./run.sh train to start again."
   [ "$rc" = "0" ] || die "Training failed. The report in cnn/artifacts/training_report.html shows where."
   ok "model saved to cnn/artifacts/. Start ./run.sh to use it (restart it if it is already running)"
 }
@@ -248,10 +281,11 @@ cmd_train() {
 # ------------------------------------------------------------------ ./run.sh download
 cmd_download() {
   ensure_env full
-  local what; what="$(cd clef-server && "$PY" download_model.py --describe)" || die "clef-server is not set up correctly."
+  local what ram need use
+  what="$(cd clef-server && "$PY" download_model.py --describe)" || die "clef-server is not set up correctly (download_model.py --describe failed)."
   step "Download CLEF-Flash: $what"
   if clef_downloaded; then ok "already downloaded"; return 0; fi
-  local ram need use; ram="$(ram_gb)"
+  ram="$(ram_gb)"
   if [ "$(clef_backend)" = "mlx" ]; then need=16; use="7–9 GB"; else need=32; use="about 20 GB"; fi
   if [ "$ram" -gt 0 ] && [ "$ram" -lt "$need" ]; then
     warn "this machine has ${ram} GB of memory; CLEF-Flash needs ${use} while running (${need} GB+ recommended)."
@@ -262,56 +296,119 @@ cmd_download() {
 }
 
 # ------------------------------------------------------------------ first-run / setup wizard
+# offer <skip-pref> <heading> <question> <Y|N default> <command> <short name for "didn't finish">
+# Runs the command in a subshell, so its `die` only ends that step, and with `set -e` really on
+# (it would be silently off if the subshell were the left side of `||`).
+offer() {
+  local pref="$1" heading="$2" question="$3" def="$4" cmd="$5" what="$6" rc stopped=0
+  step "$heading"
+  if ask "$question" "$def"; then
+    # Ctrl+C reaches this shell too. The trap (reset to default inside the subshell) only notes
+    # it, so the step can finish its own cleanup; then the whole wizard stops.
+    trap 'stopped=1' INT
+    set +e; ( set -e; "cmd_$cmd" ); rc=$?; set -e
+    trap - INT
+    if [ "$stopped" = "1" ] || [ "$rc" = "130" ]; then interrupted "Stopped."; fi
+    if [ "$rc" != "0" ]; then
+      if [ "$cmd" = "download" ]; then warn "$what didn't finish. Later: ./run.sh download (it resumes)"
+      else warn "$what didn't finish. Later: ./run.sh $cmd"; fi
+    fi
+  else
+    pref_set "$pref"; warn "skipped. Later: ./run.sh $cmd"
+  fi
+}
+# offer_setup [verbose]: offer to set up each missing piece, unless the user said "skip" before.
 offer_setup() {
   if ! interactive; then [ "${1:-}" = "verbose" ] && warn "setup questions need an interactive terminal"; return 0; fi
   local missing=0
   if ! llm_configured && ! pref_has skip-llm; then
     missing=1
-    step "The LLM isn't configured yet"
-    if ask "Set it up now? (takes a minute)" Y; then ( cmd_llm ) || warn "LLM setup didn't finish. Later: ./run.sh llm"
-    else pref_set skip-llm; warn "skipped. Later: ./run.sh llm"; fi
+    offer skip-llm "The LLM isn't configured yet" "Set it up now? (takes a minute)" Y llm "LLM setup"
   fi
   if ! cnn_trained && ! pref_has skip-train; then
     missing=1
-    step "The CNN isn't trained yet"
-    if ask "Train it now? (~20 min, ~5 GB one-time download)" N; then ( cmd_train ) || warn "training didn't finish. Later: ./run.sh train"
-    else pref_set skip-train; warn "skipped. Later: ./run.sh train"; fi
+    offer skip-train "The CNN isn't trained yet" "Train it now? (~20 min, ~5 GB one-time download)" N train "training"
   fi
   if ! clef_downloaded && ! pref_has skip-download; then
     missing=1
-    step "CLEF-Flash weights aren't downloaded yet"
-    if ask "Download them now? ($(clef_size))" N; then ( cmd_download ) || warn "download didn't finish. Later: ./run.sh download (it resumes)"
-    else pref_set skip-download; warn "skipped. Later: ./run.sh download"; fi
+    offer skip-download "CLEF-Flash weights aren't downloaded yet" "Download them now? ($(clef_size))" N download "download"
   fi
   if [ "$missing" = "1" ]; then say ""; say "  ${DIM}Models that aren't set up show a 'not set up' card with the command to fix it.${RST}"
   elif [ "${1:-}" = "verbose" ]; then ok "everything is set up"; fi
   return 0
 }
+cmd_setup() {
+  ensure_env full
+  rm -f "$PREFS"   # forget earlier "skip" answers
+  offer_setup verbose
+}
 
-# ------------------------------------------------------------------ start
-port_free() { "$PY" -c "import socket,sys; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); sys.exit(s.connect_ex(('127.0.0.1', $1)) == 0)"; }
+# ------------------------------------------------------------------ ./run.sh (start)
+# busy_ports PORT... -> prints those already in use (one Python start for all of them)
+busy_ports() {
+  "$PY" - "$@" <<'PY'
+import socket, sys
+for port in sys.argv[1:]:
+    with socket.socket() as s:
+        s.settimeout(0.5)
+        if s.connect_ex(("127.0.0.1", int(port))) == 0:
+            print(port)
+PY
+}
+lan_address() {   # this machine's address on the local network (no packet is sent)
+  "$PY" -c "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(('10.255.255.255', 1)); print(s.getsockname()[0])" 2>/dev/null || true
+}
 open_browser() {
   [ "${NO_BROWSER:-0}" = "1" ] && return 0
-  if command -v open >/dev/null 2>&1 && [ "$(uname)" = "Darwin" ]; then open "$UI_URL"
+  if is_mac && command -v open >/dev/null 2>&1; then open "$UI_URL"
   elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$UI_URL" >/dev/null 2>&1 || true; fi
 }
 
-PIDS=""; NAMES=""
-start_bg() {  # start_bg name dir cmd...
+# Running services as "pid:name pid:name ..." (a string, not an array: see the bash 3.2 note at the top).
+SERVICES=""
+start_bg() {  # start_bg name dir cmd...   (output goes to logs/<name>.log)
   local name="$1" dir="$2"; shift 2
   (cd "$dir" && exec "$@") > "$LOGS/$name.log" 2>&1 &
-  PIDS="$PIDS $!"; NAMES="$NAMES $name"
+  SERVICES="$SERVICES $!:$name"
 }
+any_running() {
+  local s
+  for s in $SERVICES; do kill -0 "${s%%:*}" 2>/dev/null && return 0; done
+  return 1
+}
+# stop_all [exit code]: stop every service (politely, then forcefully after ~5 s) and exit.
 stop_all() {
+  local rc="${1:-0}" s tries=0
   trap - EXIT INT TERM
-  # shellcheck disable=SC2086
-  [ -n "$PIDS" ] && kill $PIDS 2>/dev/null || true
+  for s in $SERVICES; do kill "${s%%:*}" 2>/dev/null || true; done
+  while any_running && [ "$tries" -lt 50 ]; do sleep 0.1; tries=$((tries + 1)); done
+  if any_running; then
+    for s in $SERVICES; do kill -9 "${s%%:*}" 2>/dev/null || true; done
+  fi
   wait 2>/dev/null || true
   printf '\n%sStopped. Bye!%s\n' "$DIM" "$RST"
-  exit 0
+  exit "$rc"
+}
+# Keep running; report a service that dies (e.g. a crash) instead of failing silently.
+watch_services() {
+  local dead=" " s pid name
+  while true; do
+    sleep 2
+    for s in $SERVICES; do
+      pid="${s%%:*}"; name="${s#*:}"
+      case "$dead" in *" $name "*) continue ;; esac
+      if ! kill -0 "$pid" 2>/dev/null; then
+        dead="$dead$name "
+        printf '\n%s✗ %s stopped unexpectedly. Last lines of logs/%s.log:%s\n' "$RED" "$name" "$name" "$RST"
+        tail -n 15 "$LOGS/$name.log" | sed 's/^/    /'
+        say "  ${DIM}The other models keep running. Fix the cause, then restart with Ctrl+C and ./run.sh${RST}"
+      fi
+    done
+  done
 }
 
 cmd_start() {
+  case "$PORT_UI" in ''|*[!0-9]*) die "PORT_UI must be a port number (got '$PORT_UI')." ;; esac
   if [ ! -f "$VENV/.stamp-full" ]; then
     step "Welcome to Bun Tribunal! First-time setup"
     say "  LLM vs CLEF-Flash vs CNN: three ways to tell a hot dog from everything else."
@@ -319,18 +416,22 @@ cmd_start() {
   ensure_env full
   offer_setup
 
-  local p
-  for p in $PORT_LLM $PORT_CLEF $PORT_CNN $PORT_UI; do
-    port_free "$p" || die "Port $p is already in use. Is Bun Tribunal already running in another terminal? (find it with: lsof -i :$p)"
-  done
+  local busy p
+  busy="$(busy_ports "$PORT_LLM" "$PORT_CLEF" "$PORT_CNN" "$PORT_UI")"
+  if [ -n "$busy" ]; then
+    p="$(echo "$busy" | head -1)"
+    [ "$p" = "$PORT_UI" ] && say "  ${DIM}(If something else uses port $p, start with another one: PORT_UI=9090 ./run.sh)${RST}" >&2
+    die "Port $p is already in use. Is Bun Tribunal already running in another terminal? (find it with: lsof -i :$p)"
+  fi
 
   mkdir -p "$LOGS"
-  trap stop_all EXIT INT TERM
+  trap 'stop_all $?' EXIT
+  trap 'stop_all 0' INT TERM
   # Local only by default; LAN=1 also serves your Wi-Fi, e.g. to try it on a phone.
   local bind=127.0.0.1 lan_ip=""
   if [ "${LAN:-0}" = "1" ]; then
     bind=0.0.0.0
-    lan_ip="$("$PY" -c "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(('10.255.255.255', 1)); print(s.getsockname()[0])" 2>/dev/null || true)"
+    lan_ip="$(lan_address)"
   fi
   step "Starting Bun Tribunal"
   start_bg llm  llm-server   "$PY" -m uvicorn app:app --host "$bind" --port "$PORT_LLM"
@@ -340,66 +441,59 @@ cmd_start() {
   "$PY" scripts/health.py --wait 20
   say ""
   say "  ${B}Open ${CYN}$UI_URL${RST}   ${DIM}(logs in logs/ · Ctrl+C stops everything)${RST}"
-  [ -n "$lan_ip" ] && say "  ${B}On your phone (same Wi-Fi): ${CYN}http://$lan_ip:$PORT_UI${RST}"
+  if [ "${LAN:-0}" = "1" ]; then
+    if [ -n "$lan_ip" ]; then say "  ${B}On your phone (same Wi-Fi): ${CYN}http://$lan_ip:$PORT_UI${RST}"
+    else warn "couldn't detect this machine's network address; use its IP with port $PORT_UI on your phone"; fi
+    say "  ${DIM}Anyone on this network can use it (and your LLM key). Only do this on networks you trust.${RST}"
+  fi
   open_browser
-
-  # Keep running; report a service that dies (e.g. a crash) instead of failing silently.
-  local dead="" i pid name
-  while true; do
-    sleep 2
-    i=0
-    for pid in $PIDS; do
-      # NAMES is a space-separated list; $NAMES stays unquoted so echo drops the leading space.
-      # shellcheck disable=SC2086
-      i=$((i + 1)); name="$(echo $NAMES | cut -d' ' -f$i)"
-      if ! kill -0 "$pid" 2>/dev/null && ! echo " $dead " | grep -q " $name "; then
-        dead="$dead $name"
-        printf '\n%s✗ %s stopped unexpectedly. Last lines of logs/%s.log:%s\n' "$RED" "$name" "$name" "$RST"
-        tail -n 15 "$LOGS/$name.log" | sed 's/^/    /'
-      fi
-    done
-  done
+  watch_services
 }
 
 # ------------------------------------------------------------------ status / test / help
 cmd_status() {
   step "Setup"
-  if [ -f "$VENV/.stamp-full" ]; then ok "Python environment (.venv)"; else warn "Python environment not installed yet (./run.sh)"; fi
+  if [ -f "$VENV/.stamp-full" ]; then ok "Python environment (${VENV#"$ROOT"/})"; else warn "Python environment not installed yet (./run.sh)"; fi
   if llm_configured; then ok "LLM configured: $(llm_summary)"; else warn "LLM not configured (./run.sh llm)"; fi
-  if cnn_trained; then
-    ok "CNN trained: $("$PY" -c "import json; m=json.load(open('cnn/artifacts/model_meta.json')); t=m.get('metrics',{}); print(m.get('arch','?'), '· test accuracy', format(t.get('test_acc',0),'.1%'), '·', m.get('trained_at','')[:10])" 2>/dev/null || echo yes)"
-  else warn "CNN not trained (./run.sh train)"; fi
-  if clef_downloaded; then ok "CLEF-Flash weights downloaded: $(cd clef-server && "$PY" download_model.py --describe 2>/dev/null)"; else warn "CLEF-Flash weights not downloaded (./run.sh download, $(clef_size))"; fi
+  if cnn_trained; then ok "CNN trained: $(cnn_summary)"; else warn "CNN not trained (./run.sh train)"; fi
+  if clef_downloaded; then ok "CLEF-Flash weights downloaded: $(cd clef-server && "$PY" download_model.py --describe 2>/dev/null)"
+  else warn "CLEF-Flash weights not downloaded (./run.sh download, $(clef_size))"; fi
   step "Servers"
   if [ -x "$PY" ]; then "$PY" scripts/health.py; else say "  not running"; fi
 }
 
 cmd_test() {
   ensure_env full
-  local failed=0 dir
+  local failed="" dir
   for dir in clef-server cnn llm-server; do
     step "Tests: $dir"
-    (cd "$dir" && "$PY" -m pytest -q -p no:cacheprovider) || failed=1
+    # Options (-q) come from the root pyproject.toml.
+    (cd "$dir" && "$PY" -m pytest -p no:cacheprovider) || failed="$failed $dir"
   done
-  [ "$failed" = "0" ] && step "${GRN}All tests passed${RST}" || die "Some tests failed."
+  if [ -n "$failed" ]; then die "Some tests failed:$failed"; fi
+  step "${GRN}All tests passed${RST}"
 }
 
 cmd_help() {
-  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+  # The comment block at the top of this file, up to the first blank line after it.
+  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
   say ""
-  say "Environment knobs: DEVICE=mps|cuda|cpu · ARCH=convnext_tiny|efficientnet_b0|mobilenet_v3_large (train)"
-  say "  ADD_FOOD101=0 (train without Food-101) · LAN=1 (open to phones on your Wi-Fi) · NO_BROWSER=1"
-  say "  NONINTERACTIVE=1 (never ask) · FORCE_INSTALL=1 (reinstall packages)"
+  say "Environment knobs:"
+  say "  start     LAN=1 (open to phones on your Wi-Fi) · PORT_UI=9090 (if 8080 is taken) · NO_BROWSER=1"
+  say "  train     DEVICE=mps|cuda|cpu · ARCH=convnext_tiny|efficientnet_b0|mobilenet_v3_large"
+  say "            ADD_FOOD101=0 (train without Food-101) · DATA_SOURCE=kaggle (needs a Kaggle token)"
+  say "  download  CLEF_BACKEND=mlx|torch (which CLEF-Flash weights)"
+  say "  any       NONINTERACTIVE=1 (never ask) · FORCE_INSTALL=1 (reinstall packages) · PYTHON=python3.12 · NO_COLOR=1"
 }
 
 case "${1:-start}" in
-  start|"")      cmd_start ;;
-  llm)           cmd_llm ;;
-  train)         cmd_train ;;
-  download)      cmd_download ;;
-  setup)         ensure_env full; rm -f "$PREFS"; offer_setup verbose ;;
-  status)        cmd_status ;;
-  test|tests)    cmd_test ;;
+  start|"")       cmd_start ;;
+  llm)            cmd_llm ;;
+  train)          cmd_train ;;
+  download)       cmd_download ;;
+  setup)          cmd_setup ;;
+  status)         cmd_status ;;
+  test|tests)     cmd_test ;;
   help|-h|--help) cmd_help ;;
-  *) say "Unknown command: $1"; say ""; cmd_help; exit 1 ;;
+  *) { say "Unknown command: $1"; say ""; cmd_help; } >&2; exit 1 ;;
 esac

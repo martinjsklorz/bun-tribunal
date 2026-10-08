@@ -7,7 +7,7 @@
 | | Contender | What it is | Runs |
 |---|---|---|---|
 | 🟣 | **LLM** | A general-purpose vision chatbot asked for a verdict, a confidence and a one-line reason | via any OpenAI-compatible API: OpenAI, OpenRouter, or locally with Ollama / LM Studio |
-| 🟠 | **CLEF-Flash** | Cloudflare's 9.4B decision model. It doesn't write text; it returns a probability per allowed answer | locally, as a **4-bit MLX quantization** on Apple Silicon (~6 GB); full BF16 weights elsewhere (~19 GB) |
+| 🟠 | **CLEF-Flash** | Cloudflare's 9.4B decision model. It doesn't write text; it returns a probability per allowed answer | locally: a **4-bit MLX quantization** on Apple Silicon (~6 GB), the full BF16 weights elsewhere (~19 GB) |
 | 🔵 | **CNN** | ConvNeXt-Tiny (28M params), fine-tuned on your laptop in ~20 min | locally |
 
 Upload, drop, paste or snap a photo. All three judge it in parallel, and you get their verdicts, confidences and
@@ -22,9 +22,9 @@ speeds side by side, plus a session scoreboard once you tell it the truth.
 That's it. The first run creates a Python environment, installs everything and walks you through setting up each
 model (you can skip any of them), then starts the app and opens **http://localhost:8080**. Ctrl+C stops everything.
 
-**Needs:** macOS or Linux and Python 3.11+ (`brew install python@3.12`). For CLEF-Flash: an Apple Silicon Mac with
-16 GB+ memory (it runs the 4-bit MLX version) or an NVIDIA GPU with 24 GB+ (full model). The LLM and the CNN run fine
-on smaller machines.
+**Needs:** macOS or Linux and Python 3.11+ (e.g. `brew install python@3.12`). For CLEF-Flash: an Apple Silicon Mac
+with 16 GB+ memory (4-bit MLX version) or an NVIDIA GPU with 24 GB+ (full model). The LLM and the CNN run fine on
+smaller machines.
 
 ## Everything `run.sh` does
 
@@ -32,11 +32,27 @@ on smaller machines.
 |---|---|
 | `./run.sh` | Set up what's missing (it asks first), start everything, open the browser |
 | `./run.sh llm` | Pick the LLM provider (OpenAI, OpenRouter, Ollama, LM Studio, other), enter a key, test it with one picture |
-| `./run.sh train` | Train the CNN: downloads the data, fine-tunes, evaluates, exports. Shows live progress and writes an HTML report |
+| `./run.sh train` | Train the CNN: download the data, fine-tune, evaluate, export. Shows live progress and writes an HTML report |
 | `./run.sh download` | Download the CLEF-Flash weights: 4-bit MLX on Apple Silicon (~6 GB), full model elsewhere (~19 GB). Resumable |
-| `./run.sh status` | What's set up, what's running |
+| `./run.sh status` | What's set up and what's running (the three servers and the web app) |
+| `./run.sh setup` | Ask again about everything that isn't set up yet (forgets earlier "skip" answers) |
 | `./run.sh test` | All test suites (no keys or downloads needed) |
-| `LAN=1 ./run.sh` | Also serve your Wi-Fi, to try it on your phone (the address is printed). Anyone on that Wi-Fi can then use your LLM key, so use it on networks you trust |
+| `./run.sh help` | The commands and the environment settings below |
+
+Settings go in front of the command, e.g. `PORT_UI=9090 ./run.sh`:
+
+| Setting | For | |
+|---|---|---|
+| `LAN=1` | start | Also serve your Wi-Fi, to try it on your phone (the address is printed). Anyone on that network can then use it, and your LLM key, so only do this on networks you trust |
+| `PORT_UI=9090` | start | Web app port, if 8080 is taken |
+| `NO_BROWSER=1` | start | Don't open the browser |
+| `DEVICE=mps\|cuda\|cpu` | train, start | Force a PyTorch device (CNN, and CLEF-Flash with the torch backend) |
+| `ARCH=…`, `ADD_FOOD101=0`, `DATA_SOURCE=kaggle` | train | CNN training options, see [cnn/README.md](cnn/README.md) |
+| `CLEF_BACKEND=mlx\|torch` | download, start | Which CLEF-Flash weights to download and run |
+| `NONINTERACTIVE=1` | any | Never ask; take the defaults |
+| `FORCE_INSTALL=1` | any | Reinstall the Python packages |
+| `PYTHON=python3.12` | any | Which Python creates `.venv/` |
+| `NO_COLOR=1` | any | Plain output |
 
 A model that isn't set up yet doesn't break anything. Its card says **not set up** and shows the exact command that
 fixes it, and the other models keep working. If a provider has a hiccup, every card has a **Retry** button.
@@ -64,22 +80,39 @@ with calibrated confidences, in about 20 minutes on an Apple Silicon Mac.
 The notebook `cnn/train_hotdog_cnn.ipynb` explains every step and shows Grad-CAM heatmaps of what the model looks
 at. → [cnn/README.md](cnn/README.md)
 
+**Web app** (`ui/`). Static HTML/CSS/JS, no build step. → [ui/README.md](ui/README.md)
+
 ## Project layout
 
 ```
 run.sh            the one script
-ui/               the web app (static HTML/CSS/JS, no build step)
+ui/               the web app, port 8080
 llm-server/       LLM contender, port 8003
 clef-server/      CLEF-Flash contender, port 8001
 cnn/              training notebook + CNN server, port 8002
 scripts/          small helpers used by run.sh
 CONTRACT.md       the JSON API all three servers share
-LICENSE           MIT
+requirements.txt  every Python package run.sh installs (pulls in each component's requirements.txt)
+pyproject.toml    developer tooling config (ruff, pytest)
 docs/             screenshot
+LICENSE           MIT
 ```
 
-Local state that is never committed: `.venv/` (Python packages), `llm-server/.env` (your LLM settings and key),
-`cnn/artifacts/` (your trained model and training report), `cnn/data/` (datasets), `logs/` (server logs).
+Local state that is never committed: `.venv/` (Python packages), `llm-server/.env` (your LLM settings and key; the
+previous version is kept as `.env.bak`), `cnn/artifacts/` (your trained model and training report), `cnn/data/`
+(datasets), `logs/` (server logs), `.run-prefs` (remembered "skip" answers). The CLEF-Flash weights go to the
+Hugging Face cache (`~/.cache/huggingface`, or `HF_HOME`).
+
+## Development
+
+`./run.sh test` runs the pytest suites of `clef-server/`, `cnn/` and `llm-server/`; none needs a key, a download or a
+GPU. Lint and format settings for [ruff](https://docs.astral.sh/ruff/) live in `pyproject.toml` (ruff is not installed
+by `run.sh`):
+
+```bash
+pip install ruff
+ruff check . && ruff format --check .
+```
 
 ## Troubleshooting
 
@@ -88,7 +121,7 @@ Local state that is never committed: `.venv/` (Python packages), `llm-server/.en
 - **Changed the LLM settings?** Restart `./run.sh` so the LLM server picks them up.
 - **A card says "not set up"**: run the command it shows, then restart `./run.sh`.
 - **Something crashed**: `run.sh` prints the last lines of the log; full logs are in `logs/`.
-- **Start over with a model's setup questions**: `./run.sh setup` asks again for everything that's missing.
+- **Skipped a model's setup and want it back**: `./run.sh setup` asks again for everything that's missing.
 
 ## License
 

@@ -1,0 +1,23 @@
+# Tooling config only (this is not an installable package). `ruff check . && ruff format --check .`
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = [".venv", "cnn/data", "cnn/artifacts", "logs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "C4", "PERF", "RUF"]
+ignore = ["E501", "RUF001", "RUF002", "RUF003"]  # long strings are fine; typographic quotes/dashes are intentional
+
+[tool.ruff.lint.isort]
+# The servers import their sibling modules as top-level names.
+known-first-party = ["app", "clef_backend", "download_model", "imaging", "prompt", "hotdog_data", "hotdog_model", "llm_client"]
+
+[tool.ruff.lint.per-file-ignores]
+"*/tests/*" = ["B011"]
+"cnn/*.ipynb" = ["E402", "F401", "B018"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+addopts = "-q"
