@@ -51,7 +51,6 @@ A model that isn't ready still gets asked in each round; it simply forfeits.
   double-counts.
 - "Actually it WAS a hotdog" / "It was NOT" grades all three models. Scores are kept in `localStorage`
   (`bun-tribunal:score`).
-- "Pitch deck mode" (or `?pitch=1`) is an easter egg.
 - For automated tests, `window.__bunTribunal.runSample(id)` starts a round with a sample (`hotdog`, `pizza`, `shoe`,
   `dachshund`); its promise resolves once all three verdicts (or errors) are in, or a newer round replaced it.
 

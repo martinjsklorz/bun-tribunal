@@ -1,7 +1,7 @@
 /* Bun Tribunal: vanilla JS, no build step. Loaded after config.js.
  *
  * Sections: models · DOM references · helpers · storage · network · image prep · health · cards ·
- * rounds · summary · retry · scoreboard · inputs · samples · confetti · pitch mode · phone clock · boot
+ * rounds · summary · retry · scoreboard · inputs · samples · confetti · phone clock · boot
  */
 (() => {
   'use strict';
@@ -9,7 +9,6 @@
   const CFG = window.HOTDOG_CONFIG;
   const ORDER = ['llm', 'clef', 'cnn']; // card order
   const SCORE_KEY = 'bun-tribunal:score';
-  const PITCH_KEY = 'bun-tribunal:pitch';
   const UPLOAD_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']); // what the servers accept as-is
   const SMALL_UPLOAD_BYTES = 1.5 * 1024 * 1024; // supported files up to this size skip the decode/downscale
 
@@ -61,7 +60,6 @@
     summaryTruth: $('#summary-truth'), truthGroup: $('#summary-truth .truth-buttons'),
     truthButtons: document.querySelectorAll('.truth-btn'), truthDetail: $('#truth-detail'),
     cards: $('.cards'), scoreBody: $('#score-body'), scoreFoot: $('#score-foot'), scoreReset: $('#score-reset'),
-    pitchToggle: $('#pitch-toggle'), tagline: $('#tagline'),
     dropOverlay: $('#drop-overlay'), confetti: $('#confetti'), toast: $('#toast'),
   };
 
@@ -1216,16 +1214,6 @@
     ctx.fill();
   }
 
-  // ---------- pitch deck mode (easter egg) ----------
-  function setPitch(on) {
-    document.body.classList.toggle('pitch', on);
-    dom.pitchToggle.setAttribute('aria-pressed', String(on));
-    dom.tagline.textContent = on
-      ? 'It’s like a sommelier, but for sausages. Three of them.'
-      : 'Three models enter. One sausage leaves.';
-    saveJSON(PITCH_KEY, on);
-  }
-
   // ---------- phone status bar clock ----------
   // Real local time in the browser's own hour format, without AM/PM (like a phone status bar).
   const clockFormat = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' });
@@ -1247,9 +1235,6 @@
 
   $('#origin').textContent = window.location.origin;
   $('#footer-urls').textContent = ORDER.map((k) => `${MODELS[k].name} → ${MODELS[k].url}`).join(' · ') + ' · override with ?llm=…&clef=…&cnn=…';
-
-  dom.pitchToggle.addEventListener('click', () => setPitch(!document.body.classList.contains('pitch')));
-  if (loadJSON(PITCH_KEY) === true || new URLSearchParams(window.location.search).get('pitch') === '1') setPitch(true);
 
   tickClock();
   setInterval(tickClock, 1000);
